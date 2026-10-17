@@ -1,0 +1,53 @@
+# @package _global_
+
+# PPO on the FlashDexRetarget envs: rsl-rl-lib 5.5.1's PPO / RolloutStorage / MLPModel (agents.ppo.PPOAgent) under
+# runner.on_policy_runner.OnPolicyRunner. Library defaults, except: value clipping off and observation
+# normalization on. PPO+RAgger: runner.agent.carry_steps=<rows carried> (0 = plain PPO).
+defaults:
+  - base
+  - _self_
+
+algorithm: ppo
+per_hand_actor_critic: false     # one actor-critic on the total reward (also turns rewards.split_sides off)
+updates_per_interaction_step: 1  # read by base.yaml only; the on-policy loop updates once per rollout
+max_epochs: 20000                # PPO iterations (one rollout + one update each)
+num_env_steps: ${eval:'${max_epochs} * ${runner.agent.num_steps_per_env} * ${num_envs}'}
+
+runner:
+  on_policy: true
+  max_epochs: ${max_epochs}
+  log_every_iterations: 1
+  agent:
+    class_name: agents.ppo.PPOAgent
+    device: ${device}
+    num_steps_per_env: 24        # fresh env steps per rollout (rsl_rl has no default; Isaac Lab's usual value)
+    carry_steps: 0               # RAgger: rows of the previous window carried into the next (0 = PPO)
+    clip_actions: 1.0            # sampled actions are clipped to the env's [-1, 1] action box
+    actor:                       # rsl_rl MLPModel defaults + observation normalization
+      hidden_dims: [256, 256, 256]
+      activation: elu
+      obs_normalization: true
+      distribution_cfg:
+        class_name: GaussianDistribution
+        init_std: 1.0
+        std_type: scalar
+    critic:
+      hidden_dims: [256, 256, 256]
+      activation: elu
+      obs_normalization: true
+    algorithm:                   # rsl_rl PPO constructor defaults, value clip off
+      num_learning_epochs: 5
+      num_mini_batches: 4
+      clip_param: 0.2
+      gamma: 0.99
+      lam: 0.95
+      value_loss_coef: 1.0
+      entropy_coef: 0.01
+      learning_rate: 1.0e-3
+      max_grad_norm: 1.0
+      optimizer: adam
+      use_clipped_value_loss: false
+      schedule: adaptive
+      desired_kl: 0.01
+      normalize_advantage_per_mini_batch: false
+      use_mixed_precision: false
