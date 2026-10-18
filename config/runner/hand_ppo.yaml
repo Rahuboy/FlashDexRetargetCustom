@@ -1,0 +1,74 @@
+# @package _global_
+
+# Per-hand PPO (agents.hand_ppo.HandPPOAgent) under runner.on_policy_runner.OnPolicyRunner: one actor and one critic
+# per hand on its own reward head, as FlashSAC's side actors / reward heads. Departures from config/runner/ppo.yaml:
+#   - per-hand actors (FlashSAC actor trunk without BatchNorm + the 1D-conv future-trajectory encoder, PPO Gaussian
+#     head) and per-hand critics (the rsl_rl MLP critic + the 1D-conv encoder);
+#   - entropy 0; value loss weight 2 (= DexMachina's rl_games 0.5 * critic_coef 4); rewards x0.1 and rl_games value
+#     normalization (DexMachina); rl_games' bound loss on the action means (soft bound 1.1, coef 1e-4, DexMachina);
+#   - a separate Adam optimizer and adaptive learning rate per hand (rsl_rl's rule on that hand's KL).
+# PPO+RAgger: runner.agent.carry_steps=<rows carried> (0 = plain PPO).
+defaults:
+  - base
+  - _self_
+
+algorithm: hand_ppo
+per_hand_actor_critic: true      # per-hand reward twins (rewards.split_sides) and (B, H) head rewards
+updates_per_interaction_step: 1  # read by base.yaml only; the on-policy loop updates once per rollout
+max_epochs: 20000                # PPO iterations (one rollout + one update each)
+num_env_steps: ${eval:'${max_epochs} * ${runner.agent.num_steps_per_env} * ${num_envs}'}
+
+runner:
+  on_policy: true
+  max_epochs: ${max_epochs}
+  log_every_iterations: 1
+  agent:
+    class_name: agents.hand_ppo.HandPPOAgent
+    device: ${device}
+    num_steps_per_env: 24        # fresh env steps per rollout (as config/runner/ppo.yaml)
+    carry_steps: 0               # RAgger: rows of the previous window carried into the next (0 = PPO)
+    clip_actions: 1.0            # sampled actions are clipped to the env's [-1, 1] action box
+    empty_cache_after_update: true
+
+    reward_heads:                # read by the runner's env wrapper (as config/runner/flashsac.yaml)
+      enable: ${per_hand_actor_critic}
+      overrides: {}
+      side_actors: true
+
+    traj_encoder:                # as config/runner/flashsac.yaml; one encoder per network
+      enable: true
+      aggregation: conv1d
+      n_future: 10
+      n_sides: 1
+      latent_dim: 128
+      hidden_dim: 128
+      num_layers: 2
+
+    actor:                       # FlashSAC actor trunk (actor_num_blocks 2, actor_hidden_dim 128) without BatchNorm
+      trunk: unit                # unit: FlashSAC's unit-norm weights + RMSNorm re-normalization; plain: ordinary linears
+      hidden_dim: 128
+      num_blocks: 2
+      expansion: 4
+      obs_normalization: true
+      init_std: 1.0
+    critic:                      # rsl_rl MLP critic (config/runner/ppo.yaml) + the trajectory encoder
+      hidden_dims: [256, 256, 256]
+      activation: elu
+      obs_normalization: true
+
+    algorithm:
+      num_learning_epochs: 5
+      num_mini_batches: 4
+      clip_param: 0.2
+      gamma: 0.99
+      lam: 0.95
+      value_loss_coef: 2.0       # DexMachina: rl_games loss 0.5 * critic_coef(4) * (V - R)^2
+      entropy_coef: 0.0
+      bounds_loss_coef: 1.0e-4   # DexMachina bounds_loss_coef; rl_games bound_loss soft bound 1.1
+      bounds_soft_bound: 1.1
+      reward_scale: 0.1          # DexMachina reward_shaper.scale_value
+      normalize_value: true      # DexMachina normalize_value (rl_games RunningMeanStd per hand)
+      learning_rate: 1.0e-3      # rsl_rl default (config/runner/ppo.yaml)
+      schedule: adaptive
+      desired_kl: 0.01
+      max_grad_norm: 1.0

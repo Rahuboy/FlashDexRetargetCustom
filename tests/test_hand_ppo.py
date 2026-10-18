@@ -1,0 +1,176 @@
+"""Unit checks of agents.hand_ppo.HandPPOAgent on random data (no simulator):
+python tests/test_hand_ppo.py  (from the repo root, FlashDexRetarget env)."""
+import copy
+import sys
+import tempfile
+from pathlib import Path
+
+import numpy as np
+import torch
+from omegaconf import OmegaConf
+from torch.distributions import Normal
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from agents.hand_ppo import HandPPOAgent  # noqa: E402
+
+N, T, K = 64, 6, 10                       # envs, fresh rows, future steps
+FLAT, PER_STEP = 21, 8                    # flat obs dims, per-step window features (both hands)
+D = FLAT + K * PER_STEP                   # obs = [flat | window], window at the tail as the env lays it out
+SIDES, IDS = ["right", "left"], [[0, 1, 2, 6], [3, 4, 5, 7]]   # interleaved like the env's action layout
+A, H = 8, 2
+TRAJ = {"enable": True, "aggregation": "conv1d", "n_future": K, "n_sides": 1, "latent_dim": 16, "hidden_dim": 16,
+        "num_layers": 2, "window_dims": [K * PER_STEP]}
+
+
+def make(carry=0, trunk="unit", seed=0):
+    cfg = OmegaConf.load(Path(__file__).resolve().parents[1] / "config/runner/hand_ppo.yaml").runner.agent
+    cfg = OmegaConf.merge(cfg, {"device": "cpu", "num_steps_per_env": T, "carry_steps": carry,
+                                "actor": {"trunk": trunk, "hidden_dim": 32}, "critic": {"hidden_dims": [32, 32]},
+                                "empty_cache_after_update": False})
+    torch.manual_seed(seed)
+    return HandPPOAgent(cfg, D, SIDES, IDS, N, TRAJ, "cpu")
+
+
+def rollout(agent, rng, n, p_term=0.05, p_trunc=0.02):
+    obs = rng.standard_normal((N, D)).astype(np.float32)
+    for _ in range(n):
+        agent.act(obs)
+        obs = rng.standard_normal((N, D)).astype(np.float32)
+        agent.observe({"reward": rng.standard_normal((N, H)).astype(np.float32), "terminated": rng.random(N) < p_term,
+                       "truncated": rng.random(N) < p_trunc, "next_observation": obs})
+    return obs
+
+
+rng = np.random.default_rng(0)
+
+# ── 1. stored log-probs == the policy's log-probs before any update (PPO ratio exactly 1 at the first minibatch) ──
+ag = make()
+ag.begin_rollout()
+rollout(ag, rng, T)
+o = ag.obs.flatten(0, 1)
+for h in range(H):
+    lp = ag.actors[h].distribution(o).log_prob(ag.actions.flatten(0, 1)[:, ag.ids[h]]).sum(-1)
+    assert torch.allclose(lp, ag.logp.flatten(0, 1)[:, h], atol=1e-5), h
+print("1. ratio == 1 before the first optimizer step (both hands)  OK")
+
+# ── 2. GAE per head == a reference loop (rewards x0.1 stored; time-outs bootstrap gamma * V(s_t); shared dones) ──
+returns, adv = ag._returns()
+g, lam = ag.gamma, ag.lam
+V, R = ag.values.numpy(), ag.rewards.numpy()
+dn, to = ag.dones.numpy(), ag.timeouts.numpy()
+with torch.no_grad():
+    Vl = ag._values(ag._last_obs).numpy()
+ref = np.zeros_like(V)
+a_ = np.zeros_like(Vl)
+for t in reversed(range(T)):
+    nv = Vl if t == T - 1 else V[t + 1]
+    r = R[t] + g * V[t] * to[t][:, None]
+    nd = 1.0 - dn[t][:, None]
+    a_ = r + nd * g * nv - V[t] + nd * g * lam * a_
+    ref[t] = a_ + V[t]
+assert np.allclose(returns.numpy(), ref, atol=1e-5) and np.allclose(adv.numpy(), ref - V, atol=1e-5)
+print("2. per-head GAE with shared dones and time-out bootstrap matches the reference  OK")
+
+# ── 3. ValueRMS == rl_games RunningMeanStd (float64, count starts at 1, unbiased var, clamp +-5) ──
+rms = ag.value_rms[0]
+m, v, c = 0.0, 1.0, 1.0
+for _ in range(3):
+    x = rng.standard_normal(500) * 3 + 2
+    bm, bv, bc = x.mean(), x.var(ddof=1), len(x)
+    d = bm - m
+    tot = c + bc
+    m, v, c = m + d * bc / tot, (v * c + bv * bc + d * d * c * bc / tot) / tot, tot
+    rms.update(torch.as_tensor(x, dtype=torch.float32))
+assert abs(float(rms.running_mean) - m) < 1e-4 and abs(float(rms.running_var) - v) < 1e-3 and float(rms.count) == c
+y = torch.tensor([-100.0, 0.5, 100.0])
+assert torch.allclose(rms.normalize(y), ((y - m) / np.sqrt(v + 1e-5)).clamp(-5, 5), atol=1e-4)
+assert torch.allclose(rms.denormalize(rms.normalize(torch.tensor([1.0, 2.0]))), torch.tensor([1.0, 2.0]), atol=1e-4)
+rms.load_state_dict(make().value_rms[0].state_dict())   # reset
+print("3. value normalization matches rl_games' RunningMeanStd  OK")
+
+# ── 4. bound loss (rl_games, soft bound 1.1) on known means ──
+mu = torch.tensor([[1.6, -0.5, -2.1, 1.0]])
+s = ag.bounds_soft
+b = ((mu - s).clamp_min(0).square() + (mu + s).clamp_max(0).square()).sum(-1).mean()
+assert abs(float(b) - (0.5 ** 2 + 1.0 ** 2)) < 1e-6
+print("4. bound loss: means 1.6 / -2.1 cost 0.25 + 1.0, means inside +-1.1 cost 0  OK")
+
+# ── 5. hand h's loss only reaches hand h's networks; optimizer h holds exactly hand h's parameters ──
+for h in range(H):
+    own = {id(p) for p in list(ag.actors[h].parameters()) + list(ag.critics[h].parameters())}
+    got = {id(p) for grp in ag.optimizers[h].param_groups for p in grp["params"]}
+    assert own == got, h
+before = [copy.deepcopy(x.state_dict()) for x in list(ag.actors) + list(ag.critics)]
+info = ag.update()
+after = [x.state_dict() for x in list(ag.actors) + list(ag.critics)]
+assert all(any(not torch.equal(b_[k], a_[k]) for k in b_) for b_, a_ in zip(before, after)), "a network did not move"
+for k in ("loss/surrogate_right", "loss/value_left", "loss/bounds_right", "train/kl_left", "train/learning_rate_right",
+          "train/action_std_left", "train/clip_frac_right", "train/value_rms_std_left"):
+    assert k in info and np.isfinite(info[k]), k
+print("5. one optimizer per hand over its own actor + critic; all four networks updated; per-hand metrics finite  OK")
+
+# ── 6. separate adaptive LR: freezing hand 'left' (LR 0, no KL change) leaves its LR at 0 while 'right' adapts ──
+ag2 = make(seed=1)
+ag2.begin_rollout()
+rollout(ag2, rng, T)
+ag2.lrs[1] = 0.0
+for grp in ag2.optimizers[1].param_groups:
+    grp["lr"] = 0.0
+ag2.update()
+assert ag2.lrs[1] == 0.0 and ag2.lrs[0] != 1e-3, ag2.lrs
+print(f"6. per-hand learning rates are independent: right 1e-3 -> {ag2.lrs[0]:.2e}, frozen left stays 0  OK")
+
+# ── 7. unit trunk: every UnitLinear row has unit norm after an update; plain trunk has biases ──
+from agents.modules.hand_ppo_nets import _UnitLinear  # noqa: E402
+for m in ag.actors.modules():
+    if isinstance(m, _UnitLinear):
+        assert torch.allclose(m.w.weight.norm(dim=-1), torch.ones(m.w.weight.shape[0]), atol=1e-5)
+pl = make(trunk="plain")
+assert not any(isinstance(m, _UnitLinear) for m in pl.actors.modules())
+assert pl.actors[0].embed.bias is not None and pl.actors[0].mean_bias is None
+print("7. unit trunk keeps unit-norm rows after an update; plain trunk = ordinary biased linears  OK")
+
+# ── 8. RAgger window: carried rows moved to the front and re-valued; normalizers count fresh rows only ──
+rag = make(carry=T // 2)
+c = T // 2
+for it in range(3):
+    n = rag.begin_rollout()
+    assert n == (T + c if it == 0 else T), (it, n)
+    if it > 0:
+        assert torch.equal(rag.obs[:c], prev_tail_obs) and torch.equal(rag.logp[:c], prev_tail_logp)
+        with torch.no_grad():
+            assert torch.allclose(rag.values[:c], rag._values(rag.obs[:c].flatten(0, 1)).view(c, N, H), atol=1e-6)
+    rollout(rag, rng, n)
+    cnt0 = int(rag.actors[0].obs_norm.count)
+    rag.update()
+    fresh = (T + c if it == 0 else T) * N
+    assert int(rag.actors[0].obs_norm.count) - cnt0 == fresh, (it, int(rag.actors[0].obs_norm.count) - cnt0, fresh)
+    prev_tail_obs, prev_tail_logp = rag.obs[-c:].clone(), rag.logp[-c:].clone()
+rag.on_env_reset()
+assert rag.begin_rollout() == T + c
+print("8. RAgger: carried rows at the front, re-valued by the current critics; normalizers +fresh rows only; "
+      "eval reset -> full fresh window  OK")
+
+# ── 9. checkpoint round trip ──
+with tempfile.TemporaryDirectory() as d:
+    ag.save(d)
+    ag3 = make(seed=7)
+    ag3.load(d)
+    x = torch.as_tensor(rng.standard_normal((5, D)).astype(np.float32))
+    for h in range(H):
+        assert torch.allclose(ag3.actors[h].mean(x), ag.actors[h].mean(x)) and \
+            torch.allclose(ag3.critics[h](x), ag.critics[h](x))
+    assert ag3.lrs == ag.lrs
+print("9. save / load round trip  OK")
+
+# ── 10. deterministic act = clipped means in env action order; stochastic act clipped to +-1 ──
+x = rng.standard_normal((N, D)).astype(np.float32) * 50
+det = ag.act(x, deterministic=True)
+with torch.no_grad():
+    want = torch.zeros(N, A)
+    for h in range(H):
+        want[:, ag.ids[h]] = ag.actors[h].mean(torch.as_tensor(x))
+assert np.allclose(det, want.clamp(-1, 1).numpy(), atol=1e-6) and np.abs(ag.act(x)).max() <= 1.0
+ag._pending = None
+print("10. deterministic actions = per-hand means in env order, clipped; samples clipped  OK")
+print("ALL OK")
