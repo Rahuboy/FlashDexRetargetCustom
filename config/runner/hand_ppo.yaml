@@ -2,8 +2,8 @@
 
 # Per-hand PPO (agents.hand_ppo.HandPPOAgent) under runner.on_policy_runner.OnPolicyRunner: one actor and one critic
 # per hand on its own reward head, as FlashSAC's side actors / reward heads. Departures from config/runner/ppo.yaml:
-#   - per-hand actors (FlashSAC actor trunk without BatchNorm + the 1D-conv future-trajectory encoder, PPO Gaussian
-#     head) and per-hand critics (the rsl_rl MLP critic + the 1D-conv encoder);
+#   - per-hand actors and critics: config/runner/ppo.yaml's rsl_rl MLPs (3x256 ELU, obs normalization, scalar std) with
+#     FlashSAC's 1D-conv future-trajectory encoder in front (one encoder per network);
 #   - entropy 0; value loss weight 2 (= DexMachina's rl_games 0.5 * critic_coef 4); rewards x0.1 and rl_games value
 #     normalization (DexMachina); rl_games' bound loss on the action means (soft bound 1.1, coef 1e-4, DexMachina);
 #   - a separate Adam optimizer and adaptive learning rate per hand (rsl_rl's rule on that hand's KL).
@@ -44,13 +44,11 @@ runner:
       hidden_dim: 128
       num_layers: 2
 
-    actor:                       # FlashSAC actor trunk (actor_num_blocks 2, actor_hidden_dim 128) without BatchNorm
-      trunk: unit                # unit: FlashSAC's unit-norm weights + RMSNorm re-normalization; plain: ordinary linears
-      hidden_dim: 128
-      num_blocks: 2
-      expansion: 4
+    actor:                       # rsl_rl MLP actor (config/runner/ppo.yaml) + the trajectory encoder
+      hidden_dims: [256, 256, 256]
+      activation: elu
       obs_normalization: true
-      init_std: 1.0
+      init_std: 1.0              # rsl_rl GaussianDistribution, std_type scalar
     critic:                      # rsl_rl MLP critic (config/runner/ppo.yaml) + the trajectory encoder
       hidden_dims: [256, 256, 256]
       activation: elu

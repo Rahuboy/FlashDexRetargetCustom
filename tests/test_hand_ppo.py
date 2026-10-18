@@ -22,10 +22,10 @@ TRAJ = {"enable": True, "aggregation": "conv1d", "n_future": K, "n_sides": 1, "l
         "num_layers": 2, "window_dims": [K * PER_STEP]}
 
 
-def make(carry=0, trunk="unit", seed=0):
+def make(carry=0, seed=0):
     cfg = OmegaConf.load(Path(__file__).resolve().parents[1] / "config/runner/hand_ppo.yaml").runner.agent
     cfg = OmegaConf.merge(cfg, {"device": "cpu", "num_steps_per_env": T, "carry_steps": carry,
-                                "actor": {"trunk": trunk, "hidden_dim": 32}, "critic": {"hidden_dims": [32, 32]},
+                                "actor": {"hidden_dims": [32, 32]}, "critic": {"hidden_dims": [32, 32]},
                                 "empty_cache_after_update": False})
     torch.manual_seed(seed)
     return HandPPOAgent(cfg, D, SIDES, IDS, N, TRAJ, "cpu")
@@ -120,15 +120,18 @@ ag2.update()
 assert ag2.lrs[1] == 0.0 and ag2.lrs[0] != 1e-3, ag2.lrs
 print(f"6. per-hand learning rates are independent: right 1e-3 -> {ag2.lrs[0]:.2e}, frozen left stays 0  OK")
 
-# ── 7. unit trunk: every UnitLinear row has unit norm after an update; plain trunk has biases ──
-from agents.modules.hand_ppo_nets import _UnitLinear  # noqa: E402
-for m in ag.actors.modules():
-    if isinstance(m, _UnitLinear):
-        assert torch.allclose(m.w.weight.norm(dim=-1), torch.ones(m.w.weight.shape[0]), atol=1e-5)
-pl = make(trunk="plain")
-assert not any(isinstance(m, _UnitLinear) for m in pl.actors.modules())
-assert pl.actors[0].embed.bias is not None and pl.actors[0].mean_bias is None
-print("7. unit trunk keeps unit-norm rows after an update; plain trunk = ordinary biased linears  OK")
+# ── 7. architecture: actor and critic = obs normalizer -> own traj encoder -> rsl_rl MLP; actor out = its hand's dims ──
+from rsl_rl.modules.mlp import MLP  # noqa: E402
+lat = TRAJ["latent_dim"]
+for h in range(H):
+    for net, out in ((ag.actors[h], len(IDS[h])), (ag.critics[h], 1)):
+        assert isinstance(net.mlp, MLP)
+        lin = [m for m in net.mlp if isinstance(m, torch.nn.Linear)]
+        assert lin[0].in_features == FLAT + lat and lin[-1].out_features == out, (lin[0], lin[-1])
+encs = [ag.actors[h].traj for h in range(H)] + [ag.critics[h].traj for h in range(H)]
+assert len({id(e) for e in encs}) == 4
+assert torch.allclose(ag.actors[0].std(), torch.ones(len(IDS[0])), atol=0.05)
+print(f"7. actor / critic = normalizer -> own encoder ({K}x{PER_STEP} window -> {lat}) -> rsl_rl MLP; 4 separate encoders  OK")
 
 # ── 8. RAgger window: carried rows moved to the front and re-valued; normalizers count fresh rows only ──
 rag = make(carry=T // 2)

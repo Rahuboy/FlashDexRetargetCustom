@@ -1,7 +1,8 @@
 """Per-hand PPO as an agents.Agent (config/runner/hand_ppo.yaml), driven by runner.on_policy_runner.OnPolicyRunner.
 
-One actor and one critic per hand (agents.modules.hand_ppo_nets), each hand trained on its own reward head, as in
-the FlashSAC recipe's side actors and reward heads: the env splits every two-hand reward term into per-hand twins
+One actor and one critic per hand (agents.modules.hand_ppo_nets: rsl_rl's MLP actor / critic with the 1D-conv
+future-trajectory encoder in front), each hand trained on its own reward head, as in the FlashSAC recipe's side
+actors and reward heads: the env splits every two-hand reward term into per-hand twins
 (rewards.split_sides, via per_hand_actor_critic=true) and the vec-env wrapper returns (B, H) head rewards. The hands
 share the episode ends (dones) and the observation.
 
@@ -308,7 +309,6 @@ class HandPPOAgent(Agent):
                     nn.utils.clip_grad_norm_(self.actors[h].parameters(), self.max_grad_norm)
                     nn.utils.clip_grad_norm_(self.critics[h].parameters(), self.max_grad_norm)
                     self.optimizers[h].step()
-                    self.actors[h].normalize_parameters()
                     stats["surrogate"][h] += float(surrogate)
                     stats["value"][h] += float(value_loss)
                     stats["bounds"][h] += float(bounds)

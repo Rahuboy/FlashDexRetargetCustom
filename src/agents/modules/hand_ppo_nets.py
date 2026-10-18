@@ -1,29 +1,20 @@
 """Networks of the per-hand PPO agent (agents.hand_ppo): one actor and one critic per hand.
 
-Both read the full flat env observation: a running observation normalizer (rsl_rl EmpiricalNormalization) over
-every input dim, then the 1D-conv FutureTrajEncoder over the future-trajectory window at the obs tail (each network
-has its own encoder), then the trunk.
-
-Actor trunk = FlashSAC's actor trunk without BatchNorm: a bias-free embedding linear, ``num_blocks`` residual blocks
-(linear -> ReLU -> linear -> ReLU, plus skip, width ``hidden_dim`` expanded ``expansion``x inside the block) and an
-RMSNorm. ``trunk: unit`` keeps FlashSAC's weight constraint (every linear row re-normalized to unit norm and the
-RMSNorm scale to norm sqrt(d) after each optimizer step, via ``normalize_parameters``); ``trunk: plain`` uses
-ordinary biased linears and a plain RMSNorm. Head: PPO's Gaussian (rsl_rl GaussianDistribution, ``std_type
-scalar``): an unsquashed mean (unit-norm linear + bias, or a plain linear) and a learned state-independent std per
-action dim, clamped to [1e-6, 1e6].
-
-Critic = rsl_rl's MLP critic (hidden dims, activation) on [flat obs | trajectory latent], one scalar output (the
-value in normalized units; agents.hand_ppo de-normalizes it).
+Both are rsl_rl's MLPModel layout with the 1D-conv FutureTrajEncoder in front: a running observation normalizer
+(rsl_rl EmpiricalNormalization) over every input dim, then the encoder over the future-trajectory window at the obs
+tail (each network has its own encoder; the window is replaced by its latent), then rsl_rl's MLP (PyTorch default
+init, as rsl_rl's MLPModel). The actor's MLP outputs the means of its hand's action dims; its std is rsl_rl's
+GaussianDistribution with std_type "scalar" (a learned state-independent std per dim, clamped to [1e-6, 1e6]). The
+critic's MLP outputs one value (in normalized units when agents.hand_ppo normalizes values).
 """
 
 from __future__ import annotations
 
-import math
 from typing import Any
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from rsl_rl.modules.mlp import MLP
 from rsl_rl.modules.normalization import EmpiricalNormalization
 from torch.distributions import Normal
 
@@ -32,92 +23,35 @@ from .traj_encoder import FutureTrajEncoder
 _STD_RANGE = (1e-6, 1e6)   # rsl_rl GaussianDistribution's default clamp for std_type "scalar"
 
 
-class _UnitLinear(nn.Module):
-    """FlashSAC's UnitLinear: bias-free, orthogonal init, rows re-normalized to unit norm after every step."""
+class _EncodedMLP(nn.Module):
+    """obs normalizer -> FutureTrajEncoder (window -> latent) -> rsl_rl MLP."""
 
-    def __init__(self, d_in: int, d_out: int) -> None:
+    def __init__(self, obs_dim: int, out_dim: int, traj_cfg: dict[str, Any] | None, cfg: dict[str, Any]) -> None:
         super().__init__()
-        self.w = nn.Linear(d_in, d_out, bias=False)
-        nn.init.orthogonal_(self.w.weight, gain=1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.w(x)
-
-    @torch.no_grad()
-    def normalize_parameters(self) -> None:
-        self.w.weight.copy_(F.normalize(self.w.weight, dim=-1, eps=1e-8))
-
-
-class _RMSNorm(nn.Module):
-    """FlashSAC's UnitRMSNorm (``unit``: scale re-normalized to norm sqrt(d) after every step) or a plain RMSNorm."""
-
-    def __init__(self, d: int, unit: bool, eps: float = 1e-6) -> None:
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(d))
-        self.eps = eps
-        self.unit = unit
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x / torch.sqrt(torch.mean(x * x, dim=-1, keepdim=True) + self.eps) * self.weight
-
-    @torch.no_grad()
-    def normalize_parameters(self) -> None:
-        if self.unit:
-            d = self.weight.shape[-1]
-            self.weight.mul_(math.sqrt(d) * torch.rsqrt(torch.sum(self.weight * self.weight) + 1e-8))
-
-
-def _linear(d_in: int, d_out: int, unit: bool) -> nn.Module:
-    return _UnitLinear(d_in, d_out) if unit else nn.Linear(d_in, d_out)
-
-
-class _Block(nn.Module):
-    """FlashSACBlock without its two BatchNorms: x + relu(W2 relu(W1 x))."""
-
-    def __init__(self, hidden_dim: int, expansion: int, unit: bool) -> None:
-        super().__init__()
-        self.w1 = _linear(hidden_dim, hidden_dim * expansion, unit)
-        self.w2 = _linear(hidden_dim * expansion, hidden_dim, unit)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + F.relu(self.w2(F.relu(self.w1(x))))
-
-
-def _make_obs_norm(obs_dim: int, enabled: bool) -> nn.Module:
-    return EmpiricalNormalization(obs_dim) if enabled else nn.Identity()
-
-
-class HandActor(nn.Module):
-    """One hand's policy: obs normalizer -> traj encoder -> FlashSAC trunk (no BatchNorm) -> PPO Gaussian head."""
-
-    def __init__(self, obs_dim: int, action_dim: int, traj_cfg: dict[str, Any] | None, cfg: dict[str, Any]) -> None:
-        super().__init__()
-        unit = str(cfg.get("trunk", "unit")) == "unit"
-        if str(cfg.get("trunk", "unit")) not in ("unit", "plain"):
-            raise ValueError(f"actor.trunk must be 'unit' or 'plain', got {cfg.get('trunk')!r}")
-        hidden = int(cfg.get("hidden_dim", 128))
-        self.obs_norm = _make_obs_norm(obs_dim, bool(cfg.get("obs_normalization", True)))
+        self.obs_norm = EmpiricalNormalization(obs_dim) if bool(cfg.get("obs_normalization", True)) else nn.Identity()
         self.traj = FutureTrajEncoder(traj_cfg) if traj_cfg else None
         d_in = obs_dim if self.traj is None else obs_dim - self.traj.window_width + self.traj.latent_dim
-        self.embed = _linear(d_in, hidden, unit)
-        self.blocks = nn.ModuleList(
-            _Block(hidden, int(cfg.get("expansion", 4)), unit) for _ in range(int(cfg.get("num_blocks", 2)))
-        )
-        self.post_norm = _RMSNorm(hidden, unit)
-        self.mean_w = _linear(hidden, action_dim, unit)
-        self.mean_bias = nn.Parameter(torch.zeros(action_dim)) if unit else None
+        self.mlp = MLP(d_in, out_dim, [int(h) for h in cfg.get("hidden_dims", [256, 256, 256])],
+                       str(cfg.get("activation", "elu")))
+
+    def features(self, obs: torch.Tensor) -> torch.Tensor:
+        x = self.obs_norm(obs)
+        return x if self.traj is None else self.traj(x)
+
+    def update_normalization(self, obs: torch.Tensor) -> None:
+        if isinstance(self.obs_norm, EmpiricalNormalization):
+            self.obs_norm.update(obs)
+
+
+class HandActor(_EncodedMLP):
+    """One hand's policy: means from the encoded MLP, learned state-independent std (rsl_rl scalar std)."""
+
+    def __init__(self, obs_dim: int, action_dim: int, traj_cfg: dict[str, Any] | None, cfg: dict[str, Any]) -> None:
+        super().__init__(obs_dim, action_dim, traj_cfg, cfg)
         self.std_param = nn.Parameter(float(cfg.get("init_std", 1.0)) * torch.ones(action_dim))
-        self.normalize_parameters()
 
     def mean(self, obs: torch.Tensor) -> torch.Tensor:
-        x = self.obs_norm(obs)
-        if self.traj is not None:
-            x = self.traj(x)
-        x = self.embed(x)
-        for block in self.blocks:
-            x = block(x)
-        x = self.mean_w(self.post_norm(x))
-        return x if self.mean_bias is None else x + self.mean_bias
+        return self.mlp(self.features(obs))
 
     def std(self) -> torch.Tensor:
         return self.std_param.clamp(*_STD_RANGE)
@@ -125,43 +59,15 @@ class HandActor(nn.Module):
     def distribution(self, obs: torch.Tensor) -> Normal:
         return Normal(self.mean(obs), self.std())
 
-    def normalize_parameters(self) -> None:
-        for m in self.modules():
-            if m is not self and hasattr(m, "normalize_parameters"):
-                m.normalize_parameters()
 
-    def update_normalization(self, obs: torch.Tensor) -> None:
-        if isinstance(self.obs_norm, EmpiricalNormalization):
-            self.obs_norm.update(obs)
-
-
-class HandCritic(nn.Module):
-    """One hand's value function: obs normalizer -> traj encoder -> rsl_rl-style MLP -> 1 (normalized value)."""
-
-    _ACTS = {"elu": nn.ELU, "relu": nn.ReLU, "tanh": nn.Tanh, "silu": nn.SiLU}
+class HandCritic(_EncodedMLP):
+    """One hand's value function: the encoded MLP with one output."""
 
     def __init__(self, obs_dim: int, traj_cfg: dict[str, Any] | None, cfg: dict[str, Any]) -> None:
-        super().__init__()
-        self.obs_norm = _make_obs_norm(obs_dim, bool(cfg.get("obs_normalization", True)))
-        self.traj = FutureTrajEncoder(traj_cfg) if traj_cfg else None
-        d = obs_dim if self.traj is None else obs_dim - self.traj.window_width + self.traj.latent_dim
-        act = self._ACTS[str(cfg.get("activation", "elu"))]
-        layers: list[nn.Module] = []
-        for h in [int(x) for x in cfg.get("hidden_dims", [256, 256, 256])]:
-            layers += [nn.Linear(d, h), act()]
-            d = h
-        layers.append(nn.Linear(d, 1))
-        self.mlp = nn.Sequential(*layers)
+        super().__init__(obs_dim, 1, traj_cfg, cfg)
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        x = self.obs_norm(obs)
-        if self.traj is not None:
-            x = self.traj(x)
-        return self.mlp(x).squeeze(-1)
-
-    def update_normalization(self, obs: torch.Tensor) -> None:
-        if isinstance(self.obs_norm, EmpiricalNormalization):
-            self.obs_norm.update(obs)
+        return self.mlp(self.features(obs)).squeeze(-1)
 
 
 class ValueRMS(nn.Module):
