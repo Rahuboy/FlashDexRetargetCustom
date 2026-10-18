@@ -50,9 +50,23 @@ runner:
       obs_normalization: true
       init_std: 1.0              # rsl_rl GaussianDistribution, std_type scalar
     critic:                      # rsl_rl MLP critic (config/runner/ppo.yaml) + the trajectory encoder
+      arch: mlp                  # mlp (FDR-10/11) | flashsac: FlashSAC's critic as V(s) (agents.modules.hand_ppo_nets)
       hidden_dims: [256, 256, 256]
       activation: elu
       obs_normalization: true
+      # arch: flashsac only — config/runner/flashsac.yaml's critic (critic_num_blocks 2, critic_hidden_dim 1024,
+      # critic_num_bins 101 over [-5, 5]) without the action input, cross-entropy on two-hot normalized returns, its own
+      # Adam with FlashSAC's LR (3e-4, cosine to 1.5e-4 over every critic update, no warmup, no gradient clipping)
+      hidden_dim: 1024
+      num_blocks: 2
+      num_bins: 101
+      min_v: -5.0
+      max_v: 5.0
+      lr_init: 3.0e-4
+      lr_peak: 3.0e-4
+      lr_end: 1.5e-4
+      lr_warmup_updates: 0
+      lr_decay_updates: ${eval:'${max_epochs} * ${runner.agent.algorithm.num_learning_epochs} * ${runner.agent.algorithm.num_mini_batches}'}
 
     algorithm:
       num_learning_epochs: 5

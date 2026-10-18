@@ -70,6 +70,77 @@ class HandCritic(_EncodedMLP):
         return self.mlp(self.features(obs)).squeeze(-1)
 
 
+class FlashSACValueCritic(nn.Module):
+    """FlashSAC's critic member as a state-value function V(s) (``critic.arch: flashsac``): the same layers as one
+    member of rsl_rl_flashsac's FlashSACDoubleCritic behind the FutureTrajEncoder, without the action input —
+    FlashSACEmbedder (UnitBatchNorm over the raw [obs | trajectory latent], then a unit-norm linear to ``hidden_dim``),
+    ``num_blocks`` FlashSACBlocks (unit-norm linears hidden -> 4 hidden -> hidden, UnitBatchNorm, ReLU, residual),
+    UnitRMSNorm, and the categorical head (unit-norm linear + bias -> ``num_bins`` logits over [min_v, max_v]; value =
+    expected bin). No separate observation normalizer (the BatchNorm normalizes the inputs, as in FlashSAC).
+    BatchNorm uses batch statistics in the update (``logits(..., training=True)``) and running statistics everywhere
+    else (``forward``: rollout values, bootstrap values, RAgger re-valuation). Trained by cross-entropy against the
+    two-hot projection of the normalized return (``ce_loss``); ``normalize_parameters`` re-projects the unit-norm
+    weights after every optimizer step (FlashSAC)."""
+
+    def __init__(self, obs_dim: int, traj_cfg: dict[str, Any] | None, cfg: dict[str, Any]) -> None:
+        super().__init__()
+        from rsl_rl_flashsac.modules.flash_sac_layers import (
+            FlashSACBlock,
+            FlashSACEmbedder,
+            UnitLinear,
+            UnitRMSNorm,
+        )
+
+        self.traj = FutureTrajEncoder(traj_cfg) if traj_cfg else None
+        d_in = obs_dim if self.traj is None else obs_dim - self.traj.window_width + self.traj.latent_dim
+        hidden = int(cfg.get("hidden_dim", 1024))
+        self.num_bins = int(cfg.get("num_bins", 101))
+        self.min_v, self.max_v = float(cfg.get("min_v", -5.0)), float(cfg.get("max_v", 5.0))
+        self.embedder = FlashSACEmbedder(d_in, hidden)
+        self.blocks = nn.ModuleList(FlashSACBlock(hidden) for _ in range(int(cfg.get("num_blocks", 2))))
+        self.post_norm = UnitRMSNorm(hidden)
+        self.head = UnitLinear(hidden, self.num_bins)
+        self.head_bias = nn.Parameter(torch.zeros(self.num_bins))
+        self.register_buffer("bin_values", torch.linspace(self.min_v, self.max_v, self.num_bins))
+        self.normalize_parameters()
+
+    def logits(self, obs: torch.Tensor, training: bool) -> torch.Tensor:
+        x = obs if self.traj is None else self.traj(obs)
+        x = self.embedder(x, training=training)
+        for block in self.blocks:
+            x = block(x, training=training)
+        return self.head(self.post_norm(x)) + self.head_bias
+
+    def expectation(self, logits: torch.Tensor) -> torch.Tensor:
+        return (torch.softmax(logits, dim=-1) * self.bin_values).sum(-1)
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        return self.expectation(self.logits(obs, training=False))
+
+    def two_hot(self, y: torch.Tensor) -> torch.Tensor:
+        """(B,) targets -> (B, num_bins) weights on the two nearest bins; their expectation equals the clamped target."""
+        pos = (y.clamp(self.min_v, self.max_v) - self.min_v) / (self.max_v - self.min_v) * (self.num_bins - 1)
+        lo = pos.floor().long().clamp(0, self.num_bins - 1)
+        hi = (lo + 1).clamp(max=self.num_bins - 1)
+        w_hi = pos - lo.to(pos.dtype)
+        t = torch.zeros(y.shape[0], self.num_bins, device=y.device, dtype=pos.dtype)
+        t.scatter_add_(1, lo[:, None], (1.0 - w_hi)[:, None])
+        t.scatter_add_(1, hi[:, None], w_hi[:, None])
+        return t
+
+    def ce_loss(self, logits: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        return -(self.two_hot(y) * torch.log_softmax(logits, dim=-1)).sum(-1).mean()
+
+    @torch.no_grad()
+    def normalize_parameters(self) -> None:
+        for m in self.modules():
+            if m is not self and hasattr(m, "normalize_parameters"):
+                m.normalize_parameters()
+
+    def update_normalization(self, obs: torch.Tensor) -> None:
+        """No running observation normalizer (the embedder's BatchNorm normalizes the inputs)."""
+
+
 class ValueRMS(nn.Module):
     """rl_games' RunningMeanStd for one value head (DexMachina's ``normalize_value``): float64 running mean/var
     with count initialized to 1, unbiased batch variance, epsilon 1e-5, outputs clamped to [-5, 5]; ``denorm``

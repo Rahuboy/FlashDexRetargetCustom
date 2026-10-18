@@ -22,11 +22,13 @@ TRAJ = {"enable": True, "aggregation": "conv1d", "n_future": K, "n_sides": 1, "l
         "num_layers": 2, "window_dims": [K * PER_STEP]}
 
 
-def make(carry=0, seed=0):
+def make(carry=0, seed=0, critic=None):
     cfg = OmegaConf.load(Path(__file__).resolve().parents[1] / "config/runner/hand_ppo.yaml").runner.agent
     cfg = OmegaConf.merge(cfg, {"device": "cpu", "num_steps_per_env": T, "carry_steps": carry,
-                                "actor": {"hidden_dims": [32, 32]}, "critic": {"hidden_dims": [32, 32]},
+                                "actor": {"hidden_dims": [32, 32]}, "critic": {"hidden_dims": [32, 32], "lr_decay_updates": 40},
                                 "empty_cache_after_update": False})
+    if critic:
+        cfg = OmegaConf.merge(cfg, {"critic": critic})
     torch.manual_seed(seed)
     return HandPPOAgent(cfg, D, SIDES, IDS, N, TRAJ, "cpu")
 
@@ -176,4 +178,45 @@ with torch.no_grad():
 assert np.allclose(det, want.clamp(-1, 1).numpy(), atol=1e-6) and np.abs(ag.act(x)).max() <= 1.0
 ag._pending = None
 print("10. deterministic actions = per-hand means in env order, clipped; samples clipped  OK")
+# ── 11. critic.arch=flashsac: FlashSAC critic as V(s), categorical CE, own optimizer + FlashSAC LR schedule ──
+import math  # noqa: E402
+from agents.modules.hand_ppo_nets import FlashSACValueCritic  # noqa: E402
+from rsl_rl_flashsac.modules.flash_sac_layers import UnitLinear  # noqa: E402
+FS = {"arch": "flashsac", "hidden_dim": 32, "lr_decay_updates": 40}
+fs = make(critic=FS, seed=3)
+c0 = fs.critics[0]
+assert isinstance(c0, FlashSACValueCritic) and not hasattr(c0, "obs_norm")
+y = torch.tensor([-7.0, -5.0, -1.234, 0.0, 0.05, 3.333, 5.0, 9.0])
+t = c0.two_hot(y)
+assert torch.allclose(t.sum(-1), torch.ones(len(y))) and torch.allclose((t * c0.bin_values).sum(-1), y.clamp(-5, 5), atol=1e-5)
+for h in range(H):
+    a_ids = {id(p) for g in fs.optimizers[h].param_groups for p in g["params"]}
+    c_ids = {id(p) for g in fs.critic_optimizers[h].param_groups for p in g["params"]}
+    assert a_ids == {id(p) for p in fs.actors[h].parameters()} and c_ids == {id(p) for p in fs.critics[h].parameters()}
+bn_before = c0.embedder.norm.running_mean.clone()
+for it in range(2):
+    fs.begin_rollout()
+    rollout(fs, rng, T)
+    info = fs.update()
+assert not torch.equal(bn_before, c0.embedder.norm.running_mean)          # batch statistics used in the update
+for m in fs.critics.modules():
+    if isinstance(m, UnitLinear):
+        assert torch.allclose(m.w.weight.norm(dim=-1), torch.ones(m.w.weight.shape[0]), atol=1e-5)
+steps = 2 * 5 * 4
+want = 1.5e-4 + (3e-4 - 1.5e-4) * 0.5 * (1 + math.cos(math.pi * steps / 40))
+assert abs(info["train/critic_lr_right"] - want) < 1e-12 and fs.critic_schedulers[1].last_epoch == steps, info["train/critic_lr_right"]
+for k in ("loss/value_right", "train/value_mse_left", "train/critic_lr_left", "loss/surrogate_left"):
+    assert k in info and np.isfinite(info[k]), k
+x = torch.as_tensor(rng.standard_normal((5, D)).astype(np.float32))
+with torch.no_grad():
+    assert torch.equal(c0(x), c0(x))                                        # eval-mode BatchNorm: deterministic
+with tempfile.TemporaryDirectory() as d:
+    fs.save(d)
+    fs2 = make(critic=FS, seed=9)
+    fs2.load(d)
+    with torch.no_grad():
+        assert torch.allclose(fs2.critics[0](x), c0(x))
+    assert fs2.critic_schedulers[0].last_epoch == steps
+print(f"11. flashsac critic: two-hot exact, own Adam (LR {info['train/critic_lr_right']:.3e} = cosine), BN batch stats in the "
+      f"update, unit-norm rows, metrics finite, save/load  OK")
 print("ALL OK")

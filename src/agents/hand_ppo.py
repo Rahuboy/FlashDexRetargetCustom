@@ -38,7 +38,7 @@ import torch.nn as nn
 from omegaconf import DictConfig, OmegaConf
 
 from .base import Agent
-from .modules.hand_ppo_nets import HandActor, HandCritic, ValueRMS
+from .modules.hand_ppo_nets import FlashSACValueCritic, HandActor, HandCritic, ValueRMS
 
 
 class HandPPOAgent(Agent):
@@ -91,13 +91,38 @@ class HandPPOAgent(Agent):
         actor_cfg = OmegaConf.to_container(cfg.actor, resolve=True)
         critic_cfg = OmegaConf.to_container(cfg.critic, resolve=True)
         self.actors = nn.ModuleList(HandActor(obs_dim, len(i), traj_cfg, actor_cfg) for i in side_action_ids).to(device)
-        self.critics = nn.ModuleList(HandCritic(obs_dim, traj_cfg, critic_cfg) for _ in self.sides).to(device)
+        self.critic_arch = str(critic_cfg.get("arch", "mlp"))
+        if self.critic_arch not in ("mlp", "flashsac"):
+            raise ValueError(f"critic.arch must be 'mlp' or 'flashsac', got {self.critic_arch!r}")
+        if self.critic_arch == "flashsac" and not self.normalize_value:
+            raise ValueError("critic.arch=flashsac predicts normalized values on [min_v, max_v]: set normalize_value")
+        critic_cls = FlashSACValueCritic if self.critic_arch == "flashsac" else HandCritic
+        self.critics = nn.ModuleList(critic_cls(obs_dim, traj_cfg, critic_cfg) for _ in self.sides).to(device)
         self.value_rms = nn.ModuleList(ValueRMS() for _ in self.sides).to(device)
         self.lrs = [float(a["learning_rate"])] * self.H
-        self.optimizers = [
-            torch.optim.Adam(list(self.actors[h].parameters()) + list(self.critics[h].parameters()), lr=self.lrs[h])
-            for h in range(self.H)
-        ]
+        self.critic_optimizers: list[torch.optim.Optimizer] = []
+        self.critic_schedulers: list[torch.optim.lr_scheduler.LambdaLR] = []
+        if self.critic_arch == "mlp":
+            # one optimizer per hand over its actor + critic; the adaptive LR (hand h's KL) drives both
+            self.optimizers = [
+                torch.optim.Adam(list(self.actors[h].parameters()) + list(self.critics[h].parameters()), lr=self.lrs[h])
+                for h in range(self.H)
+            ]
+        else:
+            # actor: per-hand Adam with the adaptive LR; critic: its own Adam with FlashSAC's warmup-cosine LR
+            # (rsl_rl_flashsac FlashSAC: Adam defaults, base LR = peak, LambdaLR(schedule / peak), no gradient clipping)
+            from rsl_rl_flashsac.utils import warmup_cosine_decay_scheduler
+
+            self.optimizers = [torch.optim.Adam(self.actors[h].parameters(), lr=self.lrs[h]) for h in range(self.H)]
+            peak = float(critic_cfg["lr_peak"])
+            sched = warmup_cosine_decay_scheduler(
+                init_value=float(critic_cfg["lr_init"]), peak_value=peak, end_value=float(critic_cfg["lr_end"]),
+                warmup_steps=int(critic_cfg["lr_warmup_updates"]), decay_steps=int(critic_cfg["lr_decay_updates"]))
+            for h in range(self.H):
+                opt = torch.optim.Adam(self.critics[h].parameters(), lr=peak)
+                self.critic_optimizers.append(opt)
+                self.critic_schedulers.append(
+                    torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=lambda step, _s=sched, _p=peak: _s(step) / _p))
         self.actors.train()
         self.critics.train()
 
@@ -268,7 +293,10 @@ class HandPPOAgent(Agent):
                 cols.append(self.value_rms[h].normalize(returns[:, h]))
             targets = torch.stack(cols, dim=-1)
 
-        stats = {k: [0.0] * self.H for k in ("surrogate", "value", "bounds", "entropy", "kl", "clip_frac")}
+        keys = ("surrogate", "value", "bounds", "entropy", "kl", "clip_frac")
+        if self.critic_arch == "flashsac":
+            keys += ("value_mse",)
+        stats = {k: [0.0] * self.H for k in keys}
         mb = B // self.num_mb
         n_updates = 0
         for _ in range(self.epochs):
@@ -298,17 +326,33 @@ class HandPPOAgent(Agent):
                     a_h = adv[rows, h]
                     surrogate = torch.max(-a_h * ratio,
                                           -a_h * ratio.clamp(1.0 - self.clip_param, 1.0 + self.clip_param)).mean()
-                    v = self.critics[h](o)
-                    value_loss = (targets[rows, h] - v).square().mean()
+                    if self.critic_arch == "flashsac":
+                        logits = self.critics[h].logits(o, training=True)
+                        value_loss = self.critics[h].ce_loss(logits, targets[rows, h])
+                        with torch.no_grad():
+                            stats["value_mse"][h] += float(
+                                (self.critics[h].expectation(logits) - targets[rows, h]).square().mean())
+                    else:
+                        v = self.critics[h](o)
+                        value_loss = (targets[rows, h] - v).square().mean()
                     s = self.bounds_soft
                     bounds = ((mu_new - s).clamp_min(0.0).square() + (mu_new + s).clamp_max(0.0).square()).sum(-1).mean()
                     entropy = dist.entropy().sum(-1).mean()
                     loss = surrogate + self.vf_coef * value_loss + self.bounds_coef * bounds - self.ent_coef * entropy
                     self.optimizers[h].zero_grad(set_to_none=True)
-                    loss.backward()
-                    nn.utils.clip_grad_norm_(self.actors[h].parameters(), self.max_grad_norm)
-                    nn.utils.clip_grad_norm_(self.critics[h].parameters(), self.max_grad_norm)
-                    self.optimizers[h].step()
+                    if self.critic_arch == "mlp":
+                        loss.backward()
+                        nn.utils.clip_grad_norm_(self.actors[h].parameters(), self.max_grad_norm)
+                        nn.utils.clip_grad_norm_(self.critics[h].parameters(), self.max_grad_norm)
+                        self.optimizers[h].step()
+                    else:
+                        self.critic_optimizers[h].zero_grad(set_to_none=True)
+                        loss.backward()
+                        nn.utils.clip_grad_norm_(self.actors[h].parameters(), self.max_grad_norm)
+                        self.optimizers[h].step()
+                        self.critic_optimizers[h].step()
+                        self.critic_schedulers[h].step()
+                        self.critics[h].normalize_parameters()
                     stats["surrogate"][h] += float(surrogate)
                     stats["value"][h] += float(value_loss)
                     stats["bounds"][h] += float(bounds)
@@ -338,6 +382,8 @@ class HandPPOAgent(Agent):
                 out[f"loss/{k}_{name}" if k in ("surrogate", "value", "bounds", "entropy") else f"train/{k}_{name}"] = \
                     v[h] / n_updates
             out[f"train/learning_rate_{name}"] = self.lrs[h]
+            if self.critic_optimizers:
+                out[f"train/critic_lr_{name}"] = float(self.critic_optimizers[h].param_groups[0]["lr"])
             out[f"train/action_std_{name}"] = float(self.actors[h].std().mean())
             out[f"train/return_mean_{name}"] = float(returns[:, h].mean())
             if self.normalize_value:
@@ -366,6 +412,8 @@ class HandPPOAgent(Agent):
             "critics": self.critics.state_dict(),
             "value_rms": self.value_rms.state_dict(),
             "optimizers": [o.state_dict() for o in self.optimizers],
+            "critic_optimizers": [o.state_dict() for o in self.critic_optimizers],
+            "critic_schedulers": [s.state_dict() for s in self.critic_schedulers],
             "lrs": list(self.lrs),
         }, os.path.join(path, "hand_ppo.pt"))
 
@@ -378,6 +426,10 @@ class HandPPOAgent(Agent):
         self.value_rms.load_state_dict(state["value_rms"])
         for o, s in zip(self.optimizers, state["optimizers"]):
             o.load_state_dict(s)
+        for o, s in zip(self.critic_optimizers, state.get("critic_optimizers", [])):
+            o.load_state_dict(s)
+        for sch, s in zip(self.critic_schedulers, state.get("critic_schedulers", [])):
+            sch.load_state_dict(s)
         self.lrs = [float(x) for x in state["lrs"]]
         for o, lr in zip(self.optimizers, self.lrs):
             for g in o.param_groups:
