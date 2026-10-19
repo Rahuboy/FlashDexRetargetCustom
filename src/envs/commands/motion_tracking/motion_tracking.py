@@ -124,7 +124,7 @@ class MotionTrackingCommand(MotionTrackingCommandBase):
             self._uniform_sampling(env_ids)
         elif self.cfg.sampling.mode == "sgs" and self._sgs is not None and not self._eval_mode:
             self._sgs_record(env_ids)
-            clip, start = self._sgs.draw(env_ids)
+            clip, start = self._sgs_draw(env_ids)
             self.motion_ids[env_ids] = clip
             self.motion_steps[env_ids] = start
         else:

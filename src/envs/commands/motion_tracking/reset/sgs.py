@@ -2,7 +2,8 @@
 
 Configuration i = (clip c, start-frame bin b): the start frame is drawn uniformly inside bin b of [0, 0.99 T_c), b in
 [0, num_bins), so N = num_clips * num_bins and equal weights reproduce the uniform sampler (uniform clip, uniform start
-frame in [0, 0.99 T_c)). Each configuration keeps its last ``history`` Boolean episode outcomes; p_i = their mean (0 with
+frame in [0, 0.99 T_c)). In the Isaac per-env-object scene an env may only draw its object's configurations: P is
+restricted to them per env (the clip mix stays fixed by the scene; SGS re-weights the start-frame bins). Each configuration keeps its last ``history`` Boolean episode outcomes; p_i = their mean (0 with
 no outcome yet). Weights (paper Eq. 1-2): w_i = (p_i + eps)^(kappa t) (1 - p_i + eps)^(kappa (1 - t)),
 l_i = log(w_i + eps), P(i) = softmax(l / T). Every reset draws i.i.d. from P.
 
@@ -68,9 +69,18 @@ class SuccessGuidedSampler:
         w = (p + self.eps).pow(self.kappa * self.target) * (1.0 - p + self.eps).pow(self.kappa * (1.0 - self.target))
         return torch.softmax(torch.log(w + self.eps) / self.temperature, dim=0)
 
-    def draw(self, env_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """New configuration per env: returns (clip ids, start frames) and starts its episode bookkeeping."""
-        idx = torch.multinomial(self.probs(), len(env_ids), replacement=True)
+    def draw(self, env_ids: torch.Tensor, allowed: torch.Tensor | None = None,
+             allowed_count: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        """New configuration per env: returns (clip ids, start frames) and starts its episode bookkeeping.
+        ``allowed`` (n, K) / ``allowed_count`` (n,): per-env configuration ids it may draw (padded; the Isaac per-env-object
+        scene pins each env to its object's clips) -> P restricted to them and renormalized."""
+        pr = self.probs()
+        if allowed is None:
+            idx = torch.multinomial(pr, len(env_ids), replacement=True)
+        else:
+            k = torch.arange(allowed.shape[1], device=self.device)[None, :]
+            w = torch.where(k < allowed_count[:, None], pr[allowed], torch.zeros((), device=self.device))
+            idx = allowed.gather(1, torch.multinomial(w, 1)).squeeze(1)
         clip = idx // self.num_bins
         b = (idx % self.num_bins).float()
         u = torch.rand(len(env_ids), device=self.device)

@@ -117,4 +117,29 @@ except ValueError:
 st_keys = sorted(s.stats())
 assert "SGS/entropy_norm" in st_keys and "SGS/mean_success" in st_keys
 print("5. invalidate drops running episodes; state_dict round trip exact; mismatched table refused; stats keys  OK")
+# ── 6. restricted draw (Isaac per-env objects): only the env's configurations; empty table -> uniform within them ──
+s = SGS(frames, 6, 2, cfg(num_bins=4), "cpu")
+allowed = torch.tensor([[0, 1, 2, 3, 0, 0, 0, 0], [4, 5, 6, 7, 8, 9, 10, 11]])     # clip 0 only | clips 1 and 2
+counts = torch.tensor([4, 8])
+rows = torch.tensor([0, 0, 0, 1, 1, 1])
+seen = {0: [], 1: []}
+for _ in range(4000):
+    c, st = s.draw(torch.arange(6), allowed[rows], counts[rows])
+    for r in (0, 1):
+        seen[r].append(s.env_cfg[rows == r])
+a0, a1 = torch.cat(seen[0]), torch.cat(seen[1])
+assert set(a0.tolist()) <= {0, 1, 2, 3} and set(a1.tolist()) <= set(range(4, 12))
+h0 = torch.bincount(a0, minlength=12)[:4].float() / len(a0)
+h1 = torch.bincount(a1, minlength=12)[4:].float() / len(a1)
+assert (h0 - 0.25).abs().max() < 0.015 and (h1 - 0.125).abs().max() < 0.012, (h0, h1)
+s.outcomes[5, :3] = torch.tensor([True, False, True]); s.counts[5] = 4                 # p = 0.5 on config 5
+pr = s.probs()
+c2 = []
+for _ in range(4000):
+    s.draw(torch.arange(6), allowed[rows], counts[rows])
+    c2.append(s.env_cfg[rows == 1])
+h = torch.bincount(torch.cat(c2), minlength=12)[4:].float()
+ref = pr[4:12] / pr[4:12].sum()
+assert (h / h.sum() - ref).abs().max() < 0.012, (h / h.sum(), ref)                  # restricted + renormalized
+print("6. restricted draw: stays inside each env's configurations, uniform when empty, P renormalized within  OK")
 print("ALL OK")

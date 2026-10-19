@@ -52,12 +52,27 @@ class IsaacMotionTrackingCommand(MotionTrackingCommand):
         self._slot_motion_table = table
         self._slot_motion_count = counts
 
+    def _sgs_draw(self, env_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """SGS restricted to the env's object slot: its motions x all start-frame bins."""
+        assigned = getattr(self._env.scene, "assigned_obj_slot", None)
+        if assigned is None or self._slot_motion_table is None:
+            return super()._sgs_draw(env_ids)
+        if getattr(self, "_sgs_slot_cfgs", None) is None:
+            nb = self._sgs.num_bins
+            tab = self._slot_motion_table                                   # (S, maxM) motion ids
+            cfgs = (tab[:, :, None] * nb + torch.arange(nb, device=self.device)[None, None, :]).reshape(tab.shape[0], -1)
+            self._sgs_slot_cfgs = cfgs                                      # (S, maxM * nb); valid prefix below
+            self._sgs_slot_ncfg = self._slot_motion_count * nb
+        slot = assigned[env_ids]
+        return self._sgs.draw(env_ids, self._sgs_slot_cfgs[slot], self._sgs_slot_ncfg[slot])
+
     def _resample_command(self, env_ids: torch.Tensor) -> None:
         assigned = getattr(self._env.scene, "assigned_obj_slot", None)
         if (
             assigned is None
             or self._eval_mode
             or self.motion_lib.num_trajectories <= 1
+            or (self.cfg.sampling.mode == "sgs" and self._sgs is not None)   # SGS draws within the slot itself
         ):
             return super()._resample_command(env_ids)
 

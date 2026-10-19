@@ -53,6 +53,10 @@ class SamplingMixin:
         if succ is not None and succ.numel() > 0:
             log["SGS/batch_success"] = float(succ.float().mean())
 
+    def _sgs_draw(self, env_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """(clip, start frame) per env from the SGS distribution (subclasses restrict it, e.g. per-env objects)."""
+        return self._sgs.draw(env_ids)
+
     def _sgs_accumulate(self) -> None:
         """Per-step object errors of the running SGS episodes (tracking success)."""
         if self._sgs.success_mode != "tracking" or not self.has_objects:
