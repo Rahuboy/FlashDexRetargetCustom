@@ -17,8 +17,19 @@ commands:
   site_names: ${robot.site_names}
 
   sampling:
-    mode: "uniform"   # uniform | start
+    mode: "uniform"   # uniform | start | sgs (Success Guided Sampling, reset/sgs.py; training only)
     start_frame: 0
+    sgs:              # mode=sgs only; paper manipulation values (sgs-rl.pdf Sec. 3.2)
+      num_bins: 32          # start-frame bins per clip -> clips x 32 configurations
+      history: 100          # H outcomes per configuration
+      target: 0.5           # t
+      kappa: 1.0
+      temperature: 2.0      # T
+      eps: 1.0e-4
+      success: tracking     # completion: reached the clip end | tracking: completion + the eval's SR MT-Obj@1 test
+      grace_steps: 15       # tracking: = eval TrackingPerformance grace_steps
+      obj_trans: 0.03       # tracking: = eval SR@1 obj_trans (m)
+      obj_rot_deg: 30.0     # tracking: = eval SR@1 obj_rot_deg
 
   # Episode-constant bias on the references served to obs and RSI; rewards keep the clean ones.
   ref_noise:

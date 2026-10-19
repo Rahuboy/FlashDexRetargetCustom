@@ -12,9 +12,26 @@ if TYPE_CHECKING:
 
 
 @dataclass(kw_only=True)
+class SgsCfg:
+    """Success Guided Sampling (reset/sgs.py); used when ``MotionSamplingCfg.mode == "sgs"``."""
+
+    num_bins: int = 32          # start-frame bins per clip: configurations = clips x bins
+    history: int = 100          # outcomes kept per configuration (H)
+    target: float = 0.5         # target success rate t
+    kappa: float = 1.0          # concentration
+    temperature: float = 2.0    # softmax temperature T
+    eps: float = 1e-4
+    success: Literal["completion", "tracking"] = "tracking"
+    grace_steps: int = 15       # tracking: = the eval's TrackingPerformance grace_steps
+    obj_trans: float = 0.03     # tracking: = the eval's SR@1 obj_trans (m)
+    obj_rot_deg: float = 30.0   # tracking: = the eval's SR@1 obj_rot_deg
+
+
+@dataclass(kw_only=True)
 class MotionSamplingCfg:
-    mode: Literal["uniform", "start"] = "uniform"
+    mode: Literal["uniform", "start", "sgs"] = "uniform"
     start_frame: int = 0
+    sgs: SgsCfg = field(default_factory=SgsCfg)
 
 
 @dataclass(kw_only=True)

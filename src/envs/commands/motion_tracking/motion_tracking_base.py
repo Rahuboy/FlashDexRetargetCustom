@@ -293,6 +293,8 @@ class MotionTrackingCommandBase(
         self.cfg.sampling.start_frame = start_frame
         self._eval_mode = True
         self._eval_real = True
+        if getattr(self, "_sgs", None) is not None:
+            self._sgs.invalidate()   # interrupted training episodes are not SGS outcomes
 
     def set_train_mode(self) -> None:
         self.cfg.sampling.mode = self._train_sampling_mode

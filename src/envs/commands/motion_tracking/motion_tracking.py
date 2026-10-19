@@ -102,8 +102,8 @@ class MotionTrackingCommand(MotionTrackingCommandBase):
             for _s in _pst.values():
                 _s["active"][env_ids] = False
 
-        # Eval keeps its assigned motion_ids.
-        if not self._eval_mode and self.motion_lib.num_trajectories > 1:
+        # Eval keeps its assigned motion_ids; SGS draws the clip together with the start frame.
+        if not self._eval_mode and self.cfg.sampling.mode != "sgs" and self.motion_lib.num_trajectories > 1:
             self.motion_ids[env_ids] = torch.randint(
                 0,
                 self.motion_lib.num_trajectories,
@@ -122,9 +122,14 @@ class MotionTrackingCommand(MotionTrackingCommandBase):
             )
         elif self.cfg.sampling.mode == "uniform":
             self._uniform_sampling(env_ids)
+        elif self.cfg.sampling.mode == "sgs" and self._sgs is not None and not self._eval_mode:
+            self._sgs_record(env_ids)
+            clip, start = self._sgs.draw(env_ids)
+            self.motion_ids[env_ids] = clip
+            self.motion_steps[env_ids] = start
         else:
             raise ValueError(
-                f"sampling.mode must be 'uniform' or 'start', got {self.cfg.sampling.mode!r}"
+                f"sampling.mode must be 'uniform', 'start' or 'sgs' (train only), got {self.cfg.sampling.mode!r}"
             )
 
         # ── Robot warm start: ref noise, static offset, init noise ─────────────────
@@ -291,6 +296,8 @@ class MotionTrackingCommand(MotionTrackingCommandBase):
     # ══ Step ═══════════════════════════════════════════════════════════════════════
 
     def _update_command(self) -> None:
+        if self._sgs is not None and self.cfg.sampling.mode == "sgs" and not self._eval_mode:
+            self._sgs_accumulate()   # metrics were just updated for the current state
         self.motion_steps += 1
 
         if self._eval_mode:
@@ -301,7 +308,11 @@ class MotionTrackingCommand(MotionTrackingCommandBase):
                 self.motion_steps >= self.motion_lib._motion_num_frames[self.motion_ids]
             )[0]
             if wrap_ids.numel() > 0:
-                self._resample_command(wrap_ids)
+                self._sgs_wrap = True   # SGS: a clip end without a reset is a completed episode
+                try:
+                    self._resample_command(wrap_ids)
+                finally:
+                    self._sgs_wrap = False
 
         # Sleep mode leaves parked objects asleep; re-teleporting would wake them.
         if self.has_objects and self.multi_object and not self._sleep_mode:

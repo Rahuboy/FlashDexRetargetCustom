@@ -93,6 +93,14 @@ class OffPolicyRunner:
             self._agent.load(str((_BASE_DIR / runner_cfg.agent_load_path).resolve()))
         if runner_cfg.buffer_load_path is not None:
             self._agent.load_buffer(str((_BASE_DIR / runner_cfg.buffer_load_path).resolve()))
+        sgs = getattr(self._train_cmd, "_sgs", None)
+        if sgs is not None and runner_cfg.agent_load_path is not None:
+            sgs_src = (_BASE_DIR / runner_cfg.agent_load_path).resolve() / "sgs_state.pt"
+            if sgs_src.is_file():
+                sgs.load_state_dict(torch.load(sgs_src, map_location="cpu"))
+                print(f"[sgs] outcome table restored from {sgs_src} ({sgs.total_recorded} episodes)", flush=True)
+            else:
+                print(f"[sgs] no outcome table at {sgs_src}: starting from empty histories", flush=True)
         # Ever-success vectors ride in resume_state.json, so a resume keeps the cumulative curve.
         ever_src = runner_cfg.get("ever_state_path", None)
         if ever_src is None and runner_cfg.agent_load_path is not None:
@@ -379,6 +387,12 @@ class OffPolicyRunner:
     def _log_resume_state(self, ckpt: Path, env_step: int) -> None:
         """Write the overrides a resume needs (ckpt, step, wandb id, curriculum state) next
         to the checkpoint."""
+        sgs = getattr(self._train_cmd, "_sgs", None)
+        if sgs is not None:   # SGS outcome table (reset/sgs.py), before resume_state.json (the backup watchers' marker)
+            try:
+                torch.save(sgs.state_dict(), ckpt / "sgs_state.pt")
+            except Exception as exc:  # noqa: BLE001
+                print(f"[runner] sgs-state dump failed: {exc}")
         state = {
             "env_step": int(env_step),
             "ckpt": str(ckpt),
