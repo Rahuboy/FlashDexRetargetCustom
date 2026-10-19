@@ -2,14 +2,16 @@
 
 Both are rsl_rl's MLPModel layout with the 1D-conv FutureTrajEncoder in front: a running observation normalizer
 (rsl_rl EmpiricalNormalization) over every input dim, then the encoder over the future-trajectory window at the obs
-tail (each network has its own encoder; the window is replaced by its latent), then rsl_rl's MLP (PyTorch default
-init, as rsl_rl's MLPModel). The actor's MLP outputs the means of its hand's action dims; its std is rsl_rl's
-GaussianDistribution with std_type "scalar" (a learned state-independent std per dim, clamped to [1e-6, 1e6]). The
-critic's MLP outputs one value (in normalized units when agents.hand_ppo normalizes values).
+tail (each network has its own encoder; the window is replaced by its latent), then the trunk: rsl_rl's MLP (``arch:
+mlp``; PyTorch default init, as rsl_rl's MLPModel) or the SimBa residual trunk of the alphanist paper (``arch: simba``,
+SimbaTrunk). The actor's trunk outputs the means of its hand's action dims; its std is rsl_rl's GaussianDistribution
+with std_type "scalar" (a learned state-independent std per dim, clamped to [1e-6, 1e6]). The critic's trunk outputs
+one value (in normalized units when agents.hand_ppo normalizes values).
 """
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import torch
@@ -21,18 +23,76 @@ from torch.distributions import Normal
 from .traj_encoder import FutureTrajEncoder
 
 _STD_RANGE = (1e-6, 1e6)   # rsl_rl GaussianDistribution's default clamp for std_type "scalar"
+_SIMBA_ACTIVATIONS = {"swish": nn.SiLU, "relu": nn.ReLU}
+
+
+def _he_normal_(w: torch.Tensor) -> None:
+    """flax ``he_normal`` (SimBa's block init): variance_scaling(2, fan_in, truncated_normal) = a standard normal
+    truncated to [-2, 2], scaled by sqrt(2 / fan_in) / 0.8796... (the std of that truncated normal)."""
+    std = math.sqrt(2.0 / w.shape[1]) / 0.87962566103423978
+    nn.init.trunc_normal_(w, mean=0.0, std=std, a=-2.0 * std, b=2.0 * std)
+
+
+class SimbaBlock(nn.Module):
+    """SimBa ResidualBlock (scale_rl/networks/layers.py): x + Dense(h)(act(Dense(e * h)(LayerNorm(x)))), He-normal
+    kernels, zero biases. alphanist (Fig. 3) uses Swish as the activation; SimBa uses ReLU."""
+
+    def __init__(self, hidden: int, expansion: int, activation: str, ln_eps: float) -> None:
+        super().__init__()
+        self.ln = nn.LayerNorm(hidden, eps=ln_eps)
+        self.fc1 = nn.Linear(hidden, expansion * hidden)
+        self.act = _SIMBA_ACTIVATIONS[activation]()
+        self.fc2 = nn.Linear(expansion * hidden, hidden)
+        for fc in (self.fc1, self.fc2):
+            _he_normal_(fc.weight)
+            nn.init.zeros_(fc.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.fc2(self.act(self.fc1(self.ln(x))))
+
+
+class SimbaTrunk(nn.Module):
+    """The alphanist actor / critic trunk (Fig. 3) = SimBa's encoder (sac_network.SACEncoder, block_type residual) +
+    a linear head: linear embedding to ``hidden_dim`` (orthogonal, gain 1), ``num_blocks`` SimbaBlocks, LayerNorm,
+    linear head (orthogonal, gain ``head_init_scale``; SimBa's heads use 1). Zero biases; LayerNorm epsilon 1e-6 =
+    flax's default."""
+
+    def __init__(self, d_in: int, out_dim: int, cfg: dict[str, Any]) -> None:
+        super().__init__()
+        hidden, eps = int(cfg["hidden_dim"]), float(cfg["ln_eps"])
+        if str(cfg["activation"]) not in _SIMBA_ACTIVATIONS:
+            raise ValueError(f"simba.activation must be one of {sorted(_SIMBA_ACTIVATIONS)}, got {cfg['activation']!r}")
+        self.embed = nn.Linear(d_in, hidden)
+        self.blocks = nn.Sequential(*(SimbaBlock(hidden, int(cfg["expansion"]), str(cfg["activation"]), eps)
+                                      for _ in range(int(cfg["num_blocks"]))))
+        self.post_ln = nn.LayerNorm(hidden, eps=eps)
+        self.head = nn.Linear(hidden, out_dim)
+        nn.init.orthogonal_(self.embed.weight, gain=1.0)
+        nn.init.orthogonal_(self.head.weight, gain=float(cfg["head_init_scale"]))
+        nn.init.zeros_(self.embed.bias)
+        nn.init.zeros_(self.head.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.head(self.post_ln(self.blocks(self.embed(x))))
 
 
 class _EncodedMLP(nn.Module):
-    """obs normalizer -> FutureTrajEncoder (window -> latent) -> rsl_rl MLP."""
+    """obs normalizer -> FutureTrajEncoder (window -> latent) -> trunk (rsl_rl MLP or SimbaTrunk; the attribute is
+    ``mlp`` for both so the ``arch: mlp`` checkpoints keep their keys)."""
 
     def __init__(self, obs_dim: int, out_dim: int, traj_cfg: dict[str, Any] | None, cfg: dict[str, Any]) -> None:
         super().__init__()
         self.obs_norm = EmpiricalNormalization(obs_dim) if bool(cfg.get("obs_normalization", True)) else nn.Identity()
         self.traj = FutureTrajEncoder(traj_cfg) if traj_cfg else None
         d_in = obs_dim if self.traj is None else obs_dim - self.traj.window_width + self.traj.latent_dim
-        self.mlp = MLP(d_in, out_dim, [int(h) for h in cfg.get("hidden_dims", [256, 256, 256])],
-                       str(cfg.get("activation", "elu")))
+        arch = str(cfg.get("arch", "mlp"))
+        if arch == "mlp":
+            self.mlp = MLP(d_in, out_dim, [int(h) for h in cfg.get("hidden_dims", [256, 256, 256])],
+                           str(cfg.get("activation", "elu")))
+        elif arch == "simba":
+            self.mlp = SimbaTrunk(d_in, out_dim, cfg["simba"])
+        else:
+            raise ValueError(f"arch must be 'mlp' or 'simba' here, got {arch!r}")
 
     def features(self, obs: torch.Tensor) -> torch.Tensor:
         x = self.obs_norm(obs)
@@ -61,7 +121,7 @@ class HandActor(_EncodedMLP):
 
 
 class HandCritic(_EncodedMLP):
-    """One hand's value function: the encoded MLP with one output."""
+    """One hand's value function: the encoded trunk with one output (``critic.arch`` mlp or simba)."""
 
     def __init__(self, obs_dim: int, traj_cfg: dict[str, Any] | None, cfg: dict[str, Any]) -> None:
         super().__init__(obs_dim, 1, traj_cfg, cfg)

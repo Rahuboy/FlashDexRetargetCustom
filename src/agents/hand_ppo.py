@@ -92,8 +92,8 @@ class HandPPOAgent(Agent):
         critic_cfg = OmegaConf.to_container(cfg.critic, resolve=True)
         self.actors = nn.ModuleList(HandActor(obs_dim, len(i), traj_cfg, actor_cfg) for i in side_action_ids).to(device)
         self.critic_arch = str(critic_cfg.get("arch", "mlp"))
-        if self.critic_arch not in ("mlp", "flashsac"):
-            raise ValueError(f"critic.arch must be 'mlp' or 'flashsac', got {self.critic_arch!r}")
+        if self.critic_arch not in ("mlp", "flashsac", "simba"):
+            raise ValueError(f"critic.arch must be 'mlp', 'flashsac' or 'simba', got {self.critic_arch!r}")
         if self.critic_arch == "flashsac" and not self.normalize_value:
             raise ValueError("critic.arch=flashsac predicts normalized values on [min_v, max_v]: set normalize_value")
         critic_cls = FlashSACValueCritic if self.critic_arch == "flashsac" else HandCritic
@@ -102,7 +102,7 @@ class HandPPOAgent(Agent):
         self.lrs = [float(a["learning_rate"])] * self.H
         self.critic_optimizers: list[torch.optim.Optimizer] = []
         self.critic_schedulers: list[torch.optim.lr_scheduler.LambdaLR] = []
-        if self.critic_arch == "mlp":
+        if self.critic_arch != "flashsac":   # mlp or simba: HandCritic, joint optimizer, MSE
             # one optimizer per hand over its actor + critic; the adaptive LR (hand h's KL) drives both
             self.optimizers = [
                 torch.optim.Adam(list(self.actors[h].parameters()) + list(self.critics[h].parameters()), lr=self.lrs[h])
@@ -340,7 +340,7 @@ class HandPPOAgent(Agent):
                     entropy = dist.entropy().sum(-1).mean()
                     loss = surrogate + self.vf_coef * value_loss + self.bounds_coef * bounds - self.ent_coef * entropy
                     self.optimizers[h].zero_grad(set_to_none=True)
-                    if self.critic_arch == "mlp":
+                    if self.critic_arch != "flashsac":
                         loss.backward()
                         nn.utils.clip_grad_norm_(self.actors[h].parameters(), self.max_grad_norm)
                         nn.utils.clip_grad_norm_(self.critics[h].parameters(), self.max_grad_norm)

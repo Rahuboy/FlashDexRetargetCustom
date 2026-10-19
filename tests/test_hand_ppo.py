@@ -22,13 +22,15 @@ TRAJ = {"enable": True, "aggregation": "conv1d", "n_future": K, "n_sides": 1, "l
         "num_layers": 2, "window_dims": [K * PER_STEP]}
 
 
-def make(carry=0, seed=0, critic=None):
+def make(carry=0, seed=0, critic=None, actor=None):
     cfg = OmegaConf.load(Path(__file__).resolve().parents[1] / "config/runner/hand_ppo.yaml").runner.agent
     cfg = OmegaConf.merge(cfg, {"device": "cpu", "num_steps_per_env": T, "carry_steps": carry,
                                 "actor": {"hidden_dims": [32, 32]}, "critic": {"hidden_dims": [32, 32], "lr_decay_updates": 40},
                                 "empty_cache_after_update": False})
     if critic:
         cfg = OmegaConf.merge(cfg, {"critic": critic})
+    if actor:
+        cfg = OmegaConf.merge(cfg, {"actor": actor})
     torch.manual_seed(seed)
     return HandPPOAgent(cfg, D, SIDES, IDS, N, TRAJ, "cpu")
 
@@ -219,4 +221,53 @@ with tempfile.TemporaryDirectory() as d:
     assert fs2.critic_schedulers[0].last_epoch == steps
 print(f"11. flashsac critic: two-hot exact, own Adam (LR {info['train/critic_lr_right']:.3e} = cosine), BN batch stats in the "
       f"update, unit-norm rows, metrics finite, save/load  OK")
+# ── 12. actor.arch / critic.arch = simba: the alphanist (SimBa) residual trunk; joint optimizer + MSE like mlp ──
+from agents.modules.hand_ppo_nets import SimbaBlock, SimbaTrunk  # noqa: E402
+SB = {"arch": "simba", "simba": {"hidden_dim": 32}}
+sb = make(critic=SB, actor=SB, seed=4)
+for h in range(H):
+    for net, out, gain in ((sb.actors[h], len(IDS[h]), 0.01), (sb.critics[h], 1, 1.0)):
+        tr = net.mlp
+        assert isinstance(tr, SimbaTrunk) and len(tr.blocks) == 2 and all(isinstance(b, SimbaBlock) for b in tr.blocks)
+        assert tr.embed.in_features == FLAT + lat and tr.embed.out_features == 32 and tr.head.out_features == out
+        for b in tr.blocks:
+            assert b.fc1.out_features == 4 * 32 and b.fc2.out_features == 32 and isinstance(b.act, torch.nn.SiLU)
+            assert b.ln.eps == 1e-6 and torch.count_nonzero(b.fc1.bias) == 0 and torch.count_nonzero(b.fc2.bias) == 0
+            for fc in (b.fc1, b.fc2):                                   # flax he_normal: truncated at 2 std', var 2/fan_in
+                sd = math.sqrt(2.0 / fc.in_features)
+                assert fc.weight.abs().max() <= 2 * sd / 0.87962566103423978 + 1e-6
+                assert abs(float(fc.weight.std()) / sd - 1.0) < 0.1, (float(fc.weight.std()), sd)
+        w = tr.embed.weight                                             # orthogonal gain 1: orthonormal rows (32 < 37)
+        assert torch.allclose(w @ w.T, torch.eye(32), atol=1e-5)
+        hw = tr.head.weight                                             # orthogonal head, gain 0.01 (actor) / 1 (critic)
+        assert torch.allclose(hw @ hw.T, gain ** 2 * torch.eye(out), atol=1e-6 * max(1.0, gain ** 2) + 1e-9)
+        assert torch.count_nonzero(tr.embed.bias) == 0 and torch.count_nonzero(tr.head.bias) == 0
+    b = sb.actors[h].mlp.blocks[0]                                      # residual: x + fc2(silu(fc1(ln(x))))
+    x = torch.randn(7, 32)
+    with torch.no_grad():
+        ref = x + b.fc2(torch.nn.functional.silu(b.fc1(torch.nn.functional.layer_norm(x, (32,), b.ln.weight, b.ln.bias, 1e-6))))
+        assert torch.allclose(b(x), ref, atol=1e-6)
+    ids = {id(p) for g in sb.optimizers[h].param_groups for p in g["params"]}
+    assert ids == {id(p) for p in sb.actors[h].parameters()} | {id(p) for p in sb.critics[h].parameters()}
+assert sb.critic_optimizers == []
+x = torch.as_tensor(rng.standard_normal((256, D)).astype(np.float32))
+with torch.no_grad():
+    m0 = sb.actors[0].mean(x)
+assert float(m0.abs().max()) < 0.1, float(m0.abs().max())                 # initial means ~0 (gain 0.01 head)
+for it in range(2):
+    sb.begin_rollout()
+    rollout(sb, rng, T)
+    info = sb.update()
+for k in ("loss/value_right", "loss/surrogate_left", "train/kl_left"):
+    assert k in info and np.isfinite(info[k]), (k, info.get(k))
+with tempfile.TemporaryDirectory() as d:
+    sb.save(d)
+    sb2 = make(critic=SB, actor=SB, seed=11)
+    sb2.load(d)
+    with torch.no_grad():
+        assert torch.equal(sb2.actors[1].mean(x), sb.actors[1].mean(x)) and torch.equal(sb2.critics[0](x), sb.critics[0](x))
+n_sb = sum(p.numel() for p in sb.actors[0].mlp.parameters())
+print(f"12. simba trunk: embed {FLAT + lat}->32, 2 x [LN, 32->128 SiLU ->32, +skip], LN, head; SimBa init (orthogonal embed, "
+      f"truncated He blocks, head gain 0.01 / 1), initial |mean| max {float(m0.abs().max()):.4f}, joint Adam, 2 updates "
+      f"finite, save/load exact ({n_sb} trunk params)  OK")
 print("ALL OK")
