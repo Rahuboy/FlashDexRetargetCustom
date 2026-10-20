@@ -362,4 +362,76 @@ with tempfile.TemporaryDirectory() as d:
 print(f"13. impl=rl_games: {rg.epochs} passes x {rg.num_mb} env blocks ({E} envs x {T} rows) in fixed order, LR per pass "
       f"{[pp[0] for pp in per_pass]}, kl {info['train/kl_right']:.2e} vs kl_rollout {info['train/kl_rollout_right']:.2e}, "
       f"time-out bootstrap in the stored reward, log std 1.0, zero biases, carry + clip_value run, save/load exact  OK")
+
+# ── 14. actor.dist=categorical: FactorizedCategorical (11 bins, eps floor) vs torch.distributions; rollout / update / KL ──
+from torch.distributions import Categorical  # noqa: E402
+cat = make(actor={"dist": "categorical", "num_bins": 11, "eps": 0.01}, seed=31)
+assert cat.categorical and cat.num_bins == 11 and cat.probs.shape == (T, N, A, 11)
+vals = cat.actors[0].bin_values
+assert torch.allclose(vals, torch.linspace(-1, 1, 11)) and float(vals[5]) == 0.0
+xx = torch.as_tensor(rng.standard_normal((64, D)).astype(np.float32))
+with torch.no_grad():
+    d0 = cat.actors[0].distribution(xx)
+assert d0.probs.shape == (64, len(IDS[0]), 11)
+assert float(d0.probs.min()) >= 0.01 / 11 - 1e-7 and float((d0.probs.max(-1).values - 1 / 11).abs().max()) < 0.02   # near uniform
+ref = Categorical(probs=d0.probs)
+a0 = d0.sample()
+idx = torch.round((a0 + 1) * 5).long()
+assert torch.all((a0[..., None] == vals).any(-1))                                    # samples are bin values
+assert torch.allclose(d0.log_prob(a0), ref.log_prob(idx), atol=1e-6)
+assert torch.allclose(d0.entropy(), ref.entropy(), atol=1e-6)
+assert torch.equal(d0.mode, vals[d0.probs.argmax(-1)])
+# sampling frequencies follow p (one dim, many draws)
+with torch.no_grad():
+    lg = torch.tensor([[[3.0, 2.0, 1.0, 0.0, -1.0, -2.0, -3.0, -4.0, -5.0, -6.0, -7.0]]]).expand(200000, 1, 11)
+    from agents.modules.hand_ppo_nets import FactorizedCategorical  # noqa: E402
+    fc = FactorizedCategorical(lg, vals, 0.01)
+    freq = torch.bincount(fc.index(fc.sample()).view(-1), minlength=11).float() / 200000
+assert float((freq - fc.probs[0, 0]).abs().max()) < 0.005, (freq, fc.probs[0, 0])
+# rollout: ratio == 1 before the first step, probs stored, deterministic act = mode
+cat.begin_rollout()
+rollout(cat, rng, T)
+o_c = cat.obs.flatten(0, 1)
+for h in range(H):
+    with torch.no_grad():
+        dh = cat.actors[h].distribution(o_c)
+    lp = dh.log_prob(cat.actions.flatten(0, 1)[:, cat.ids[h]]).sum(-1)
+    assert torch.allclose(lp, cat.logp.flatten(0, 1)[:, h], atol=1e-5)
+    assert torch.allclose(dh.probs, cat.probs.flatten(0, 1)[:, cat.ids[h]], atol=1e-6)
+det = cat.act(xx.numpy(), deterministic=True)
+with torch.no_grad():
+    assert np.allclose(det[:, IDS[0]], cat.actors[0].distribution(xx).mode.numpy())
+# the update's KL = sum over dims of torch's categorical KL(old || new)
+from torch.distributions import kl_divergence  # noqa: E402
+with torch.no_grad():
+    p_new = cat.actors[1].distribution(o_c).probs
+    p_new2 = (p_new * 1.3 + 0.01) / (p_new * 1.3 + 0.01).sum(-1, keepdim=True)
+    mine = (p_new * (torch.log(p_new) - torch.log(p_new2))).sum(-1).sum(-1).mean()
+    theirs = kl_divergence(Categorical(probs=p_new), Categorical(probs=p_new2)).sum(-1).mean()
+assert torch.allclose(mine, theirs, atol=1e-6)
+info = cat.update()
+for k in ("train/action_std_right", "train/max_prob_left", "train/kl_right", "loss/surrogate_left", "train/action_std"):
+    assert k in info and np.isfinite(info[k]), k
+assert info["loss/bounds_right"] == 0.0 and info["loss/bounds_left"] == 0.0
+# RAgger carry moves the probs too; save / load exact
+cc = make(actor={"dist": "categorical"}, carry=3, seed=32)
+for it in range(2):
+    n_ = cc.begin_rollout()
+    rollout(cc, rng, n_)
+    if it == 0:
+        tail = cc.probs[cc.window - 3:].clone()                     # the rows carried into the next window
+        cc.update()
+    else:
+        assert torch.equal(cc.probs[:3], tail)
+        inf2 = cc.update()
+assert inf2["train/carried_rows"] == 3.0
+with tempfile.TemporaryDirectory() as d:
+    cat.save(d)
+    cat2 = make(actor={"dist": "categorical"}, seed=33)
+    cat2.load(d)
+    with torch.no_grad():
+        assert torch.equal(cat2.actors[0].distribution(xx).probs, cat.actors[0].distribution(xx).probs)
+print(f"14. categorical: 11 bins {[round(float(v), 1) for v in vals]}, eps floor, log_prob / entropy / KL = torch Categorical, "
+      f"sampling frequencies within 0.005, ratio == 1 at step 0, deterministic = mode, no bound loss, carry moves probs, "
+      f"save/load exact; KL {info['train/kl_right']:.2e}, action_std {info['train/action_std']:.3f}  OK")
 print("ALL OK")

@@ -107,6 +107,11 @@ class HandPPOAgent(Agent):
         actor_cfg = OmegaConf.to_container(cfg.actor, resolve=True)
         critic_cfg = OmegaConf.to_container(cfg.critic, resolve=True)
         self.actors = nn.ModuleList(HandActor(obs_dim, len(i), traj_cfg, actor_cfg) for i in side_action_ids).to(device)
+        # actor.dist=categorical: FactorizedCategorical policy (hand_ppo_nets); the rollout keeps its per-bin probs
+        self.categorical = self.actors[0].dist_type == "categorical"
+        self.num_bins = int(self.actors[0].num_bins) if self.categorical else 0
+        if self.categorical and self.impl != "rsl_rl":
+            raise ValueError("actor.dist=categorical is implemented for algorithm.impl=rsl_rl only")
         self.critic_arch = str(critic_cfg.get("arch", "mlp"))
         if self.critic_arch not in ("mlp", "flashsac", "simba"):
             raise ValueError(f"critic.arch must be 'mlp', 'flashsac' or 'simba', got {self.critic_arch!r}")
@@ -155,6 +160,7 @@ class HandPPOAgent(Agent):
         self.logp = torch.zeros(T, N, H, **z)
         self.dones = torch.zeros(T, N, dtype=torch.bool, **z)
         self.timeouts = torch.zeros(T, N, dtype=torch.bool, **z)
+        self.probs = torch.zeros(T, N, A, self.num_bins, **z) if self.categorical else None   # collecting policy
         self.step = 0
         self._pending: dict[str, torch.Tensor] | None = None
         self._last_obs: torch.Tensor | None = None
@@ -168,6 +174,11 @@ class HandPPOAgent(Agent):
               f"{self.critics[0]}", flush=True)
         print(f"[hand_ppo] window {T} rows = carry {self.carry_steps} + fresh {self.fresh_steps}; algorithm {a}; "
               f"empty_cache_after_update={self.empty_cache}", flush=True)
+        if self.categorical:
+            print(f"[hand_ppo] actor.dist=categorical: {self.num_bins} bins per action dim at "
+                  f"{[round(float(v), 3) for v in self.actors[0].bin_values]}, uniform floor eps {self.actors[0].eps}; "
+                  f"KL = categorical KL(old || new) summed over dims (desired_kl {self.desired_kl}); no bound loss; "
+                  f"deterministic action = most likely bin", flush=True)
         if self.impl == "rl_games":
             print(f"[hand_ppo] impl=rl_games: {self.epochs} passes x {self.num_mb} env-block minibatches of "
                   f"{self.num_envs // self.num_mb} envs x {T} rows; KL reference refreshed per minibatch; LR stepped per "
@@ -217,8 +228,10 @@ class HandPPOAgent(Agent):
         if self.carry_steps > 0 and self._have_prev:
             c, T = self.carry_steps, self.window
             with torch.no_grad():
-                for buf in (self.obs, self.actions, self.mu, self.sigma, self.rewards, self.logp, self.dones,
-                            self.timeouts):
+                bufs = [self.obs, self.actions, self.mu, self.sigma, self.rewards, self.logp, self.dones, self.timeouts]
+                if self.categorical:
+                    bufs.append(self.probs)
+                for buf in bufs:
                     buf[:c] = buf[T - c:].clone()
                 # re-value the carried rows with the current critics (normalizers as they are now, no update)
                 flat = self._values(self.obs[:c].flatten(0, 1))
@@ -238,6 +251,8 @@ class HandPPOAgent(Agent):
             mu = torch.zeros_like(action)
             sigma = torch.zeros_like(action)
             logp = torch.zeros(obs_t.shape[0], self.H, device=self.device)
+            probs = (torch.zeros(obs_t.shape[0], self.action_dim, self.num_bins, device=self.device)
+                     if self.categorical else None)
             for h in range(self.H):
                 dist = self.actors[h].distribution(obs_t)
                 a_h = dist.sample()
@@ -245,8 +260,12 @@ class HandPPOAgent(Agent):
                 mu[:, self.ids[h]] = dist.mean
                 sigma[:, self.ids[h]] = dist.stddev
                 logp[:, h] = dist.log_prob(a_h).sum(-1)
+                if self.categorical:
+                    probs[:, self.ids[h]] = dist.probs
             self._pending = {"obs": obs_t, "actions": action, "mu": mu, "sigma": sigma, "logp": logp,
                              "values": self._values(obs_t)}
+            if self.categorical:
+                self._pending["probs"] = probs
         return action.clamp(-self.clip_actions, self.clip_actions).cpu().numpy()
 
     def observe(self, transition: Mapping[str, Any]) -> None:
@@ -266,6 +285,8 @@ class HandPPOAgent(Agent):
         self.sigma[t] = p["sigma"]
         self.logp[t] = p["logp"]
         self.values[t] = p["values"]
+        if self.categorical:
+            self.probs[t] = p["probs"]
         if self.impl == "rl_games":   # rl_games value_bootstrap: gamma * V(s_t) joins the stored (shaped) reward
             self.rewards[t] = rewards * self.reward_scale + self.gamma * p["values"] * truncated.unsqueeze(-1).float()
         else:
@@ -331,12 +352,16 @@ class HandPPOAgent(Agent):
         keys = ("surrogate", "value", "bounds", "entropy", "kl", "clip_frac")
         if self.critic_arch == "flashsac":
             keys += ("value_mse",)
+        if self.categorical:
+            keys += ("action_std", "max_prob")
         stats = {k: [0.0] * self.H for k in keys}
         kl_rollout = [0.0] * self.H
         if self.impl == "rl_games":
             n_updates = self._update_rl_games(stats, kl_rollout, adv, targets, old_values)
         else:
-            n_updates = self._update_rsl_rl(stats, B, obs, actions, mu_old, sigma_old, logp_old, adv, targets)
+            probs_old = self.probs.flatten(0, 1) if self.categorical else None
+            n_updates = self._update_rsl_rl(stats, B, obs, actions, mu_old, sigma_old, logp_old, adv, targets,
+                                            probs_old=probs_old)
 
         # observation normalizers: the fresh rows only (the carried rows were counted when they were fresh)
         fresh = self.obs[self._carried_now:].flatten(0, 1)
@@ -364,14 +389,17 @@ class HandPPOAgent(Agent):
             out[f"train/learning_rate_{name}"] = self.lrs[h]
             if self.critic_optimizers:
                 out[f"train/critic_lr_{name}"] = float(self.critic_optimizers[h].param_groups[0]["lr"])
-            out[f"train/action_std_{name}"] = float(self.actors[h].std().mean())
+            if not self.categorical:   # categorical: action_std / max_prob come from the stats (state-dependent)
+                out[f"train/action_std_{name}"] = float(self.actors[h].std().mean())
             out[f"train/return_mean_{name}"] = float(returns[:, h].mean())
             if self.normalize_value:
                 out[f"train/value_rms_mean_{name}"] = float(self.value_rms[h].running_mean)
                 out[f"train/value_rms_std_{name}"] = float(self.value_rms[h].running_var.sqrt())
         out.update({
             "train/learning_rate": float(np.mean(self.lrs)),
-            "train/action_std": float(np.mean([float(self.actors[h].std().mean()) for h in range(self.H)])),
+            "train/action_std": (float(np.mean([stats["action_std"][h] / n_updates for h in range(self.H)]))
+                                 if self.categorical else
+                                 float(np.mean([float(self.actors[h].std().mean()) for h in range(self.H)]))),
             "train/carried_rows": float(self._carried_now),
             "train/window_rows": float(self.window),
             "train/update_time_s": t_update,
@@ -472,7 +500,7 @@ class HandPPOAgent(Agent):
 
     def _update_rsl_rl(self, stats: dict[str, list[float]], B: int, obs: torch.Tensor, actions: torch.Tensor,
                        mu_old: torch.Tensor, sigma_old: torch.Tensor, logp_old: torch.Tensor, adv: torch.Tensor,
-                       targets: torch.Tensor) -> int:
+                       targets: torch.Tensor, probs_old: torch.Tensor | None = None) -> int:
         """The rsl_rl-style epoch (impl=rsl_rl): random row minibatches, per-minibatch adaptive LR on the KL to the
         rollout policy, gradient clipping per network. Returns the number of minibatch steps."""
         mb = B // self.num_mb
@@ -488,10 +516,14 @@ class HandPPOAgent(Agent):
                     mu_new = dist.mean
                     if self.schedule == "adaptive":
                         with torch.no_grad():
-                            s_old, s_new = sigma_old[rows][:, ids], dist.stddev.expand_as(mu_new)
-                            kl = (torch.log(s_new / s_old)
-                                  + (s_old.square() + (mu_old[rows][:, ids] - mu_new).square()) / (2 * s_new.square())
-                                  - 0.5).sum(-1).mean()
+                            if self.categorical:   # KL(old || new) per dim, summed over the hand's dims
+                                p_old = probs_old[rows][:, ids]
+                                kl = (p_old * (torch.log(p_old) - dist.logp_all)).sum(-1).sum(-1).mean()
+                            else:
+                                s_old, s_new = sigma_old[rows][:, ids], dist.stddev.expand_as(mu_new)
+                                kl = (torch.log(s_new / s_old)
+                                      + (s_old.square() + (mu_old[rows][:, ids] - mu_new).square()) / (2 * s_new.square())
+                                      - 0.5).sum(-1).mean()
                             if kl > self.desired_kl * 2.0:
                                 self.lrs[h] = max(1e-5, self.lrs[h] / 1.5)
                             elif self.desired_kl / 2.0 > kl > 0.0:
@@ -514,7 +546,10 @@ class HandPPOAgent(Agent):
                         v = self.critics[h](o)
                         value_loss = (targets[rows, h] - v).square().mean()
                     s = self.bounds_soft
-                    bounds = ((mu_new - s).clamp_min(0.0).square() + (mu_new + s).clamp_max(0.0).square()).sum(-1).mean()
+                    if self.categorical:   # actions are bin values in [-1, 1] by construction
+                        bounds = torch.zeros((), device=self.device)
+                    else:
+                        bounds = ((mu_new - s).clamp_min(0.0).square() + (mu_new + s).clamp_max(0.0).square()).sum(-1).mean()
                     entropy = dist.entropy().sum(-1).mean()
                     loss = surrogate + self.vf_coef * value_loss + self.bounds_coef * bounds - self.ent_coef * entropy
                     self.optimizers[h].zero_grad(set_to_none=True)
@@ -536,6 +571,10 @@ class HandPPOAgent(Agent):
                     stats["bounds"][h] += float(bounds)
                     stats["entropy"][h] += float(entropy)
                     stats["clip_frac"][h] += float(((ratio - 1.0).abs() > self.clip_param).float().mean())
+                    if self.categorical:
+                        with torch.no_grad():
+                            stats["action_std"][h] += float(dist.stddev.mean())
+                            stats["max_prob"][h] += float(dist.probs.max(dim=-1).values.mean())
                 n_updates += 1
         return n_updates
 

@@ -55,6 +55,9 @@ runner:
       init_std: 1.0              # rsl_rl GaussianDistribution, std_type scalar
       std_type: scalar           # scalar: the std is the parameter (rsl_rl) | log: log std (rl_games fixed_sigma logstd)
       init: rsl_rl               # arch mlp: rsl_rl (PyTorch default) | rl_games (PyTorch default weights, zero biases)
+      dist: gaussian             # gaussian | categorical: an independent categorical per action dim (FDR-30)
+      num_bins: 11               # categorical: K evenly spaced action values in [-1, 1] (both ends and 0 included for odd K)
+      eps: 0.01                  # categorical: uniform floor, p = (1 - eps) softmax + eps / K (sampled from; on-policy)
       simba:                     # arch: simba only — alphanist Fig. 3 trunk after [normalized obs | trajectory latent]:
         hidden_dim: 256          #   linear 256 -> num_blocks x [LN -> linear 4x256 -> Swish -> linear 256, + skip] -> LN -> linear
         num_blocks: 2

@@ -114,13 +114,76 @@ class _EncodedMLP(nn.Module):
             self.obs_norm.update(obs)
 
 
+class FactorizedCategorical:
+    """Independent categorical per action dim over ``values`` (K evenly spaced points in [-1, 1], both ends included;
+    Tang & Agrawal 2020), mixed with a uniform floor: p = (1 - eps) softmax(logits) + eps / K. Sampling, log-probs,
+    entropy and KL all use p, so the collecting policy is the optimized one (on-policy PPO). The Normal-like surface used
+    by agents.hand_ppo: sample() / log_prob(a) / entropy() return per-dim tensors (B, A); ``mean`` / ``stddev`` are
+    the per-dim expectation / std of the action value (diagnostics); ``mode`` is the most likely value (eval)."""
+
+    def __init__(self, logits: torch.Tensor, values: torch.Tensor, eps: float) -> None:
+        k = values.numel()
+        self.values = values
+        self.probs = (1.0 - eps) * torch.softmax(logits, dim=-1) + eps / k        # (B, A, K)
+        self.logp_all = torch.log(self.probs)
+
+    def index(self, actions: torch.Tensor) -> torch.Tensor:
+        k = self.values.numel()
+        return torch.round((actions + 1.0) * 0.5 * (k - 1)).long().clamp(0, k - 1)
+
+    def sample(self) -> torch.Tensor:
+        g = -torch.log(-torch.log(torch.rand_like(self.probs).clamp_min(1e-20)).clamp_min(1e-20))   # Gumbel-max
+        return self.values[(self.logp_all + g).argmax(dim=-1)]
+
+    def log_prob(self, actions: torch.Tensor) -> torch.Tensor:
+        return self.logp_all.gather(-1, self.index(actions).unsqueeze(-1)).squeeze(-1)
+
+    def entropy(self) -> torch.Tensor:
+        return -(self.probs * self.logp_all).sum(-1)
+
+    @property
+    def mean(self) -> torch.Tensor:
+        return (self.probs * self.values).sum(-1)
+
+    @property
+    def stddev(self) -> torch.Tensor:
+        m = self.mean
+        return ((self.probs * self.values.square()).sum(-1) - m.square()).clamp_min(0.0).sqrt()
+
+    @property
+    def mode(self) -> torch.Tensor:
+        return self.values[self.probs.argmax(dim=-1)]
+
+
 class HandActor(_EncodedMLP):
     """One hand's policy: means from the encoded MLP, learned state-independent std: ``std_type`` scalar = rsl_rl's
     (the parameter is the std, clamped to [1e-6, 1e6]); log = rl_games' continuous_a2c_logstd with fixed_sigma (the
-    parameter is log std, init log(init_std), std = exp, no clamp)."""
+    parameter is log std, init log(init_std), std = exp, no clamp). With ``dist: categorical`` the trunk outputs
+    ``num_bins`` logits per action dim instead (FactorizedCategorical, uniform floor ``eps``); its head starts near
+    uniform (weights x0.01, zero bias) and ``mean(obs)`` is then the most likely bin's value (deterministic action)."""
 
     def __init__(self, obs_dim: int, action_dim: int, traj_cfg: dict[str, Any] | None, cfg: dict[str, Any]) -> None:
-        super().__init__(obs_dim, action_dim, traj_cfg, cfg)
+        dist_type = str(cfg.get("dist", "gaussian"))
+        if dist_type not in ("gaussian", "categorical"):
+            raise ValueError(f"actor.dist must be 'gaussian' or 'categorical', got {dist_type!r}")
+        k = int(cfg.get("num_bins", 11)) if dist_type == "categorical" else 1
+        super().__init__(obs_dim, action_dim * k, traj_cfg, cfg)
+        self.dist_type = dist_type
+        self.action_dim = action_dim
+        if self.dist_type == "categorical":
+            if k < 2:
+                raise ValueError(f"actor.num_bins must be >= 2, got {k}")
+            self.num_bins = k
+            self.eps = float(cfg.get("eps", 0.01))
+            if not 0.0 <= self.eps < 1.0:
+                raise ValueError(f"actor.eps must be in [0, 1), got {self.eps}")
+            self.register_buffer("bin_values", torch.linspace(-1.0, 1.0, k))
+            head = [m for m in self.mlp.modules() if isinstance(m, nn.Linear)][-1]
+            with torch.no_grad():
+                head.weight.mul_(0.01)
+                if head.bias is not None:
+                    head.bias.zero_()
+            return
         self.std_type = str(cfg.get("std_type", "scalar"))
         init_std = float(cfg.get("init_std", 1.0))
         if self.std_type == "scalar":
@@ -130,15 +193,24 @@ class HandActor(_EncodedMLP):
         else:
             raise ValueError(f"std_type must be 'scalar' or 'log', got {self.std_type!r}")
 
+    def logits(self, obs: torch.Tensor) -> torch.Tensor:
+        return self.mlp(self.features(obs)).view(obs.shape[0], self.action_dim, self.num_bins)
+
     def mean(self, obs: torch.Tensor) -> torch.Tensor:
+        if self.dist_type == "categorical":
+            return self.distribution(obs).mode
         return self.mlp(self.features(obs))
 
     def std(self) -> torch.Tensor:
+        if self.dist_type == "categorical":
+            raise RuntimeError("categorical actor: the action std is state-dependent (FactorizedCategorical.stddev)")
         if self.std_type == "log":
             return torch.exp(self.log_std_param)
         return self.std_param.clamp(*_STD_RANGE)
 
-    def distribution(self, obs: torch.Tensor) -> Normal:
+    def distribution(self, obs: torch.Tensor) -> Normal | FactorizedCategorical:
+        if self.dist_type == "categorical":
+            return FactorizedCategorical(self.logits(obs), self.bin_values, self.eps)
         return Normal(self.mean(obs), self.std())
 
 
