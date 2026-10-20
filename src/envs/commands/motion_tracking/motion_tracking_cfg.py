@@ -82,6 +82,24 @@ class ObjectXfrcCfg:
 
 
 @dataclass(kw_only=True)
+class ObjectSettleCfg:
+    """Post-reset assist settling window (video_to_data / CHORD: flash_chord ReferenceReset voc_decay_steps 20, step
+    mode; IsaacLab v2d virtual_object_control_decay_steps 20). After a TRAINING reset to a start frame > 0, the xfrc
+    assist runs at these full gains for ``steps`` env steps (in place of the pin_objects gains, or alone when
+    pin_objects is off); with ``hold_reference`` the reference stays at the reset frame for those steps and advances
+    after the last one. A reset to frame 0 and every eval reset get no window. Defaults = xfrc_curriculum_adaptive's
+    level 0 (kp_init 80, kv_init 5, rot_stiffness_mult 96 -> rotation kp x96 / kv x sqrt(96), force_range 50)."""
+
+    enable: bool = False
+    steps: int = 20
+    hold_reference: bool = True
+    kp_pos: float = 80.0
+    kv_pos: float = 5.0
+    rot_mult: float = 96.0
+    force_range: float = 50.0
+
+
+@dataclass(kw_only=True)
 class ObjectPerturbCfg:
     """Markov-burst object wrench for grasp robustness; never in eval."""
 
@@ -129,6 +147,7 @@ class ObjectCfg:
     pin_objects: bool = False
     pin_mode: Literal["xfrc", "none"] = "xfrc"
     xfrc: ObjectXfrcCfg = field(default_factory=ObjectXfrcCfg)
+    settle: ObjectSettleCfg = field(default_factory=ObjectSettleCfg)
     perturb: ObjectPerturbCfg = field(default_factory=ObjectPerturbCfg)
     static_offset: "StaticOffsetCfg" = field(default_factory=lambda: StaticOffsetCfg())
     support_disks: SupportDiskCfg = field(default_factory=SupportDiskCfg)

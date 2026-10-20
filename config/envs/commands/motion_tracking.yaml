@@ -81,6 +81,14 @@ commands:
       omega_rot: 20.0
       zeta_rot: 1.0
       contact_scale: 1.0
+    settle:               # post-reset assist settling window (video_to_data/CHORD voc_decay_steps 20); TRAINING resets to a
+      enable: false       #   start frame > 0 only (never frame 0, never eval): full xfrc gains below for `steps` env steps,
+      steps: 20           #   on even with pin_objects=false; hold_reference keeps the reference at the reset frame for
+      hold_reference: true  # those steps. Gains = xfrc_curriculum_adaptive level 0 (rotation kp x rot_mult, kv x sqrt).
+      kp_pos: 80.0
+      kv_pos: 5.0
+      rot_mult: 96.0
+      force_range: 50.0
 
     perturb:
       enabled: false

@@ -132,6 +132,18 @@ class MotionTrackingCommand(MotionTrackingCommandBase):
                 f"sampling.mode must be 'uniform', 'start' or 'sgs' (train only), got {self.cfg.sampling.mode!r}"
             )
 
+        # ── Settling window (cfg.object.settle): training resets to a start frame > 0 only ──
+        if self._settle_on:
+            if getattr(self, "_eval_real", False):
+                self._settle_left[env_ids] = 0
+                self._settle_fresh[env_ids] = False
+            else:
+                mid = self.motion_steps[env_ids] > 0
+                self._settle_left[env_ids] = mid.long() * int(self.cfg.object.settle.steps)
+                # a reset in _reset_idx is followed by this env step's command update, which must not count it;
+                # a clip-end resample inside _update_command is not
+                self._settle_fresh[env_ids] = mid & (not self._in_update)
+
         # ── Robot warm start: ref noise, static offset, init noise ─────────────────
         self._resample_ref_noise(env_ids)
 
@@ -296,9 +308,36 @@ class MotionTrackingCommand(MotionTrackingCommandBase):
     # ══ Step ═══════════════════════════════════════════════════════════════════════
 
     def _update_command(self) -> None:
+        self._in_update = True
+        try:
+            self._update_command_impl()
+        finally:
+            self._in_update = False
+
+    def _update_command_impl(self) -> None:
         if self._sgs is not None and self.cfg.sampling.mode == "sgs" and not self._eval_mode:
             self._sgs_accumulate()   # metrics were just updated for the current state
-        self.motion_steps += 1
+        if self._settle_on and not getattr(self, "_eval_real", False):
+            # One env step of the window elapsed for every env in it except those reset this step; with
+            # hold_reference the reference stays at the reset frame until the window's last step has run
+            # (flash_chord advance_reference_reset: VOC 1 and the clock held while age < steps).
+            act = self._settle_left > 0
+            self._settle_left -= (act & ~self._settle_fresh).long()
+            if self.cfg.object.settle.hold_reference:
+                self.motion_steps += (~(act & (self._settle_left > 0))).long()
+            else:
+                self.motion_steps += 1
+            self._settle_fresh.zero_()
+            if self._settle_debug and self._settle_dbg_n < 200:
+                self._settle_dbg_n += 1
+                f = getattr(self, "_settle_dbg_force", None)
+                tr = [(int(self.motion_steps[i]), int(self._settle_left[i]),
+                       round(float(f[i]), 2) if f is not None else None) for i in range(4)]
+                print(f"[settle-debug] step {self._settle_dbg_n}: in window {int((self._settle_left > 0).sum())}, "
+                      f"|wrench|>0 {int((f > 0).sum()) if f is not None else -1}; envs 0-3 (frame, left, |F|) {tr}",
+                      flush=True)
+        else:
+            self.motion_steps += 1
 
         if self._eval_mode:
             max_frames = self.motion_lib._motion_num_frames[self.motion_ids]

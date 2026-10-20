@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -27,15 +28,64 @@ class ObjectAssistMixin:
         # Assist curriculum controller (set by xfrc_curriculum_adaptive).
         self._xfrc_curr_ctrl = None
         self._obj_I_body_cache: dict[str, torch.Tensor] = {}
+        # Post-reset settling window (cfg.object.settle): env steps of full assist left per env, and the envs reset in
+        # _reset_idx this env step (the command update right after must not count them).
+        st = self.cfg.object.settle
+        self._settle_on = bool(st.enable)
+        B = self._env.num_envs
+        self._settle_left = torch.zeros(B, dtype=torch.long, device=self.device)
+        self._settle_fresh = torch.zeros(B, dtype=torch.bool, device=self.device)
+        self._in_update = False
+        self._settle_debug = os.environ.get("FDR_SETTLE_DEBUG", "0") == "1"   # smoke traces
+        self._settle_dbg_n = 0
+        if self._settle_on:
+            if int(st.steps) < 1:
+                raise ValueError(f"object.settle.steps must be >= 1, got {st.steps}")
+            if self.cfg.object.pin_mode != "xfrc":
+                raise ValueError("object.settle needs object.pin_mode=xfrc")
+            if float(self.cfg.object.xfrc.omega_rot) > 0.0:
+                raise ValueError("object.settle sets kp_rot / kv_rot: needs object.xfrc.omega_rot=0 (the flashdexretarget "
+                                 "curriculum config's value)")
+            print(f"[settle] post-reset assist window: {int(st.steps)} env steps after every training reset to a start "
+                  f"frame > 0 (none at frame 0 / in eval); hold_reference={bool(st.hold_reference)}; gains kp {st.kp_pos} "
+                  f"kv {st.kv_pos}, rotation x{st.rot_mult} / x{float(st.rot_mult) ** 0.5:.3f}, force range "
+                  f"{st.force_range}; pin_objects={bool(self.cfg.object.pin_objects)}", flush=True)
+
+    def _settle_window_gains(self, kp_pos, kd_pos, kp_rot, kd_rot, force_range):
+        """Per-env gains under the settling window: envs with steps left get cfg.object.settle's full gains; the
+        others keep the pin_objects gains (curriculum / scalar) or, with pin_objects off, no wrench (mask).
+        Returns (kp_pos, kd_pos, kp_rot, kd_rot) as (B, 1 | 3) tensors, the per-env force range (B, 1) and the
+        wrench mask (B, 1) or None."""
+        st = self.cfg.object.settle
+        B = self._env.num_envs
+        win = (self._settle_left > 0).unsqueeze(-1)  # (B, 1)
+        pin = bool(self.cfg.object.pin_objects)
+
+        def _col(g) -> torch.Tensor:
+            if isinstance(g, torch.Tensor):
+                return g.reshape(B, -1).to(self.device, torch.float32)
+            return torch.full((B, 1), float(g), device=self.device)
+
+        kp, kv, m = float(st.kp_pos), float(st.kv_pos), float(st.rot_mult)
+        gains = []
+        for base, full in ((kp_pos, kp), (kd_pos, kv), (kp_rot, kp * m), (kd_rot, kv * m ** 0.5)):
+            b = _col(base)
+            gains.append(torch.where(win, torch.full_like(b, full), b))
+        base_fr = float(force_range) if (pin and force_range is not None) else float("inf")
+        fr_env = torch.where(win, torch.full((B, 1), float(st.force_range), device=self.device),
+                             torch.full((B, 1), base_fr, device=self.device))
+        active = None if pin else win.float()
+        return gains[0], gains[1], gains[2], gains[3], fr_env, active
 
     def apply_substep(self) -> None:
         """Per-physics-substep hook (mjlab_ext._env): re-evaluate the assist PD."""
-        if self.cfg.object.pin_objects and self.has_objects:
+        if (self.cfg.object.pin_objects or self._settle_on) and self.has_objects:
             self._apply_object_assist()
 
     def _apply_object_assist(self) -> None:
         """Assist wrench from the current object state; also run per substep."""
-        if self.cfg.object.pin_objects and self.has_objects:
+        settle = self._settle_on and not getattr(self, "_eval_real", False)
+        if (self.cfg.object.pin_objects or settle) and self.has_objects:
             pin_mode = self.cfg.object.pin_mode
             if pin_mode == "xfrc":
                 # ── Gains ──────────────────────────────────────────────────────────
@@ -58,6 +108,11 @@ class ObjectAssistMixin:
                 if self._xfrc_kv_rot_env is not None:
                     kd_rot = _as_col(self._xfrc_kv_rot_env)
                 force_range = self._xfrc_force_range
+                fr_env = None   # settle: per-env force range (B, 1)
+                active = None   # settle with pin_objects off: wrench mask (B, 1)
+                if settle:
+                    kp_pos, kd_pos, kp_rot, kd_rot, fr_env, active = self._settle_window_gains(
+                        kp_pos, kd_pos, kp_rot, kd_rot, force_range)
 
                 # ── Object vs reference state ──────────────────────────────────────
                 sim_trans_all = self.sim_obj_trans_w  # (B, n_sides, 3)
@@ -134,7 +189,10 @@ class ObjectAssistMixin:
                             torque = ang_accel
 
                     # ── Clamp, implicit damping, perturbation ──────────────────────
-                    if force_range is not None:
+                    if fr_env is not None:
+                        force = torch.maximum(torch.minimum(force, fr_env), -fr_env)
+                        torque = torch.maximum(torch.minimum(torque, fr_env), -fr_env)
+                    elif force_range is not None:
                         force = force.clamp(-force_range, force_range)
                         torque = torque.clamp(-force_range, force_range)
                     if xfrc.implicit_damping:
@@ -146,6 +204,10 @@ class ObjectAssistMixin:
                     force, torque = self._maybe_apply_object_perturb(
                         side, force, torque
                     )
+                    if active is not None:   # settle, pin_objects off: only envs in their window (wrenches persist)
+                        force, torque = force * active, torque * active
+                    if settle and getattr(self, "_settle_debug", False):
+                        self._settle_dbg_force = force.norm(dim=-1).detach()
 
                     # ── Write the wrench ───────────────────────────────────────────
                     if len(obj_names) == 1:

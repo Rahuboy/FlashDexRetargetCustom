@@ -295,6 +295,9 @@ class MotionTrackingCommandBase(
         self._eval_real = True
         if getattr(self, "_sgs", None) is not None:
             self._sgs.invalidate()   # interrupted training episodes are not SGS outcomes
+        if getattr(self, "_settle_left", None) is not None:
+            self._settle_left.zero_()   # no settling window in eval (cfg.object.settle)
+            self._settle_fresh.zero_()
 
     def set_train_mode(self) -> None:
         self.cfg.sampling.mode = self._train_sampling_mode
