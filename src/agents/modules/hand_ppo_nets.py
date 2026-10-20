@@ -132,8 +132,7 @@ class FactorizedCategorical:
         return torch.round((actions + 1.0) * 0.5 * (k - 1)).long().clamp(0, k - 1)
 
     def sample(self) -> torch.Tensor:
-        g = -torch.log(-torch.log(torch.rand_like(self.probs).clamp_min(1e-20)).clamp_min(1e-20))   # Gumbel-max
-        return self.values[(self.logp_all + g).argmax(dim=-1)]
+        return self.values[torch.distributions.Categorical(probs=self.probs, validate_args=False).sample()]
 
     def log_prob(self, actions: torch.Tensor) -> torch.Tensor:
         return self.logp_all.gather(-1, self.index(actions).unsqueeze(-1)).squeeze(-1)
