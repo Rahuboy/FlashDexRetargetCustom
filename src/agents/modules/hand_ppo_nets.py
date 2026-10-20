@@ -177,7 +177,8 @@ class HandActor(_EncodedMLP):
             self.eps = float(cfg.get("eps", 0.01))
             if not 0.0 <= self.eps < 1.0:
                 raise ValueError(f"actor.eps must be in [0, 1), got {self.eps}")
-            self.register_buffer("bin_values", torch.linspace(-1.0, 1.0, k))
+            # (2j - (K - 1)) / (K - 1): evenly spaced, exact -1 / 0 (odd K) / 1 in float32 (linspace leaves ~1e-8 at 0)
+            self.register_buffer("bin_values", (2.0 * torch.arange(k, dtype=torch.float32) - (k - 1)) / (k - 1))
             head = [m for m in self.mlp.modules() if isinstance(m, nn.Linear)][-1]
             with torch.no_grad():
                 head.weight.mul_(0.01)
