@@ -62,7 +62,7 @@ def make(carry: int, clip_value: bool, epochs: int, seed: int) -> HandPPOAgent:
     cfg = OmegaConf.load(ROOT / "config/runner/hand_ppo.yaml").runner.agent
     rl = OmegaConf.load(ROOT / "config/runner/hand_ppo_rlgames.yaml").runner.agent
     cfg = OmegaConf.merge(cfg, rl, {"device": "cpu", "num_steps_per_env": T, "carry_steps": carry,
-                                    "actor": {"hidden_dims": [32, 16]}, "critic": {"hidden_dims": [32, 16]},
+                                    "actor": {"hidden_dims": [32, 16]}, "critic": {"hidden_dims": [32, 16], "lr_decay_updates": 40},
                                     "algorithm": {"num_learning_epochs": epochs, "clip_value": clip_value},
                                     "empty_cache_after_update": False})
     torch.manual_seed(seed)
