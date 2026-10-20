@@ -23,6 +23,13 @@ update; the RAgger carried rows were counted when they were fresh).
 
 Optional RAgger window (``carry_steps`` > 0), as agents.ppo.PPOAgent: the last ``carry_steps`` rows of the previous
 window move to the front and are re-valued by the current critics; the minibatches grow with the window.
+
+``algorithm.impl`` selects the update: rsl_rl (the above; default) or rl_games = DexMachina's rl_games PPO epoch per hand
+(see ``_update_rl_games``): fixed env-block minibatches in the same order every pass, the KL reference refreshed with
+each minibatch's pre-step means / stds (rl_games' dataset.update_mu_sigma), rl_games' KL(new || ref), the adaptive LR
+stepped once per pass on the pass's mean KL (rl_games' AdaptiveScheduler, LR in [1e-6, 1e-2]), one gradient-norm clip
+over the hand's actor + critic, the time-out bootstrap added to the stored reward at collection (rl_games'
+value_bootstrap), and the value loss clipped only with ``clip_value``.
 """
 
 from __future__ import annotations
@@ -87,6 +94,15 @@ class HandPPOAgent(Agent):
         self.desired_kl = float(a["desired_kl"])
         if self.schedule not in ("adaptive", "fixed"):
             raise ValueError(f"algorithm.schedule must be 'adaptive' or 'fixed', got {self.schedule!r}")
+        self.impl = str(a.get("impl", "rsl_rl"))
+        if self.impl not in ("rsl_rl", "rl_games"):
+            raise ValueError(f"algorithm.impl must be 'rsl_rl' or 'rl_games', got {self.impl!r}")
+        self.clip_value = bool(a.get("clip_value", False))
+        if self.clip_value and self.impl != "rl_games":
+            raise ValueError("algorithm.clip_value is implemented for algorithm.impl=rl_games only")
+        if self.impl == "rl_games" and self.num_envs % self.num_mb:
+            raise ValueError(f"impl=rl_games: num_envs ({self.num_envs}) must be divisible by num_mini_batches "
+                             f"({self.num_mb}); each minibatch is a block of envs with all its window rows")
 
         actor_cfg = OmegaConf.to_container(cfg.actor, resolve=True)
         critic_cfg = OmegaConf.to_container(cfg.critic, resolve=True)
@@ -96,6 +112,8 @@ class HandPPOAgent(Agent):
             raise ValueError(f"critic.arch must be 'mlp', 'flashsac' or 'simba', got {self.critic_arch!r}")
         if self.critic_arch == "flashsac" and not self.normalize_value:
             raise ValueError("critic.arch=flashsac predicts normalized values on [min_v, max_v]: set normalize_value")
+        if self.critic_arch == "flashsac" and self.impl == "rl_games":
+            raise ValueError("algorithm.impl=rl_games supports critic.arch mlp / simba (joint optimizer) only")
         critic_cls = FlashSACValueCritic if self.critic_arch == "flashsac" else HandCritic
         self.critics = nn.ModuleList(critic_cls(obs_dim, traj_cfg, critic_cfg) for _ in self.sides).to(device)
         self.value_rms = nn.ModuleList(ValueRMS() for _ in self.sides).to(device)
@@ -150,6 +168,11 @@ class HandPPOAgent(Agent):
               f"{self.critics[0]}", flush=True)
         print(f"[hand_ppo] window {T} rows = carry {self.carry_steps} + fresh {self.fresh_steps}; algorithm {a}; "
               f"empty_cache_after_update={self.empty_cache}", flush=True)
+        if self.impl == "rl_games":
+            print(f"[hand_ppo] impl=rl_games: {self.epochs} passes x {self.num_mb} env-block minibatches of "
+                  f"{self.num_envs // self.num_mb} envs x {T} rows; KL reference refreshed per minibatch; LR stepped per "
+                  f"pass (desired_kl {self.desired_kl}, LR in [1e-6, 1e-2]); joint grad clip {self.max_grad_norm}; "
+                  f"clip_value={self.clip_value}; time-out bootstrap at collection", flush=True)
 
     # ─── construction ────────────────────────────────────────────────────────────
     @classmethod
@@ -243,7 +266,10 @@ class HandPPOAgent(Agent):
         self.sigma[t] = p["sigma"]
         self.logp[t] = p["logp"]
         self.values[t] = p["values"]
-        self.rewards[t] = rewards * self.reward_scale
+        if self.impl == "rl_games":   # rl_games value_bootstrap: gamma * V(s_t) joins the stored (shaped) reward
+            self.rewards[t] = rewards * self.reward_scale + self.gamma * p["values"] * truncated.unsqueeze(-1).float()
+        else:
+            self.rewards[t] = rewards * self.reward_scale
         self.dones[t] = terminated | truncated
         self.timeouts[t] = truncated
         self.step += 1
@@ -258,7 +284,10 @@ class HandPPOAgent(Agent):
     def _returns(self) -> tuple[torch.Tensor, torch.Tensor]:
         """GAE per head over the window; returns (returns, advantages), both (T, N, H), reward-scaled units."""
         last_values = self._values(self._last_obs)
-        rewards = self.rewards + self.gamma * self.values * self.timeouts.unsqueeze(-1)
+        if self.impl == "rl_games":   # the time-out bootstrap is already in the stored reward (observe)
+            rewards = self.rewards
+        else:
+            rewards = self.rewards + self.gamma * self.values * self.timeouts.unsqueeze(-1)
         not_done = (~self.dones).float().unsqueeze(-1)
         returns = torch.zeros_like(self.values)
         adv = torch.zeros_like(last_values)
@@ -284,19 +313,168 @@ class HandPPOAgent(Agent):
         adv = adv.flatten(0, 1)
         adv = (adv - adv.mean(0, keepdim=True)) / (adv.std(0, keepdim=True) + 1e-8)
         targets = returns
+        old_values = self.values.flatten(0, 1)   # impl=rl_games clip_value: the rollout's values (normalized below)
         if self.normalize_value:
             values = self.values.flatten(0, 1)
             cols = []
+            old_cols = []
             for h in range(self.H):
                 self.value_rms[h].update(values[:, h])     # rl_games prepare_dataset: values first, then returns
+                if self.impl == "rl_games":   # rl_games normalizes the old values with the stats after their update
+                    old_cols.append(self.value_rms[h].normalize(values[:, h]))
                 self.value_rms[h].update(returns[:, h])
                 cols.append(self.value_rms[h].normalize(returns[:, h]))
             targets = torch.stack(cols, dim=-1)
+            if old_cols:
+                old_values = torch.stack(old_cols, dim=-1)
 
         keys = ("surrogate", "value", "bounds", "entropy", "kl", "clip_frac")
         if self.critic_arch == "flashsac":
             keys += ("value_mse",)
         stats = {k: [0.0] * self.H for k in keys}
+        kl_rollout = [0.0] * self.H
+        if self.impl == "rl_games":
+            n_updates = self._update_rl_games(stats, kl_rollout, adv, targets, old_values)
+        else:
+            n_updates = self._update_rsl_rl(stats, B, obs, actions, mu_old, sigma_old, logp_old, adv, targets)
+
+        # observation normalizers: the fresh rows only (the carried rows were counted when they were fresh)
+        fresh = self.obs[self._carried_now:].flatten(0, 1)
+        with torch.no_grad():
+            for h in range(self.H):
+                self.actors[h].update_normalization(fresh)
+                self.critics[h].update_normalization(fresh)
+        self._have_prev = True
+        t_update = time.perf_counter() - t0
+        t_cache = 0.0
+        if self.empty_cache and torch.cuda.is_available():
+            t1 = time.perf_counter()
+            torch.cuda.empty_cache()
+            t_cache = time.perf_counter() - t1
+
+        out: dict[str, float] = {}
+        for h, name in enumerate(self.sides):
+            for k, v in stats.items():
+                if k == "kl" and self.schedule != "adaptive" and self.impl != "rl_games":
+                    continue
+                out[f"loss/{k}_{name}" if k in ("surrogate", "value", "bounds", "entropy") else f"train/{k}_{name}"] = \
+                    v[h] / n_updates
+            if self.impl == "rl_games":   # last pass, pre-step policy vs the rows' collecting policy
+                out[f"train/kl_rollout_{name}"] = kl_rollout[h] / self.num_mb
+            out[f"train/learning_rate_{name}"] = self.lrs[h]
+            if self.critic_optimizers:
+                out[f"train/critic_lr_{name}"] = float(self.critic_optimizers[h].param_groups[0]["lr"])
+            out[f"train/action_std_{name}"] = float(self.actors[h].std().mean())
+            out[f"train/return_mean_{name}"] = float(returns[:, h].mean())
+            if self.normalize_value:
+                out[f"train/value_rms_mean_{name}"] = float(self.value_rms[h].running_mean)
+                out[f"train/value_rms_std_{name}"] = float(self.value_rms[h].running_var.sqrt())
+        out.update({
+            "train/learning_rate": float(np.mean(self.lrs)),
+            "train/action_std": float(np.mean([float(self.actors[h].std().mean()) for h in range(self.H)])),
+            "train/carried_rows": float(self._carried_now),
+            "train/window_rows": float(self.window),
+            "train/update_time_s": t_update,
+            "train/empty_cache_s": t_cache,
+        })
+        return out
+
+    def _update_rl_games(self, stats: dict[str, list[float]], kl_rollout: list[float], adv: torch.Tensor,
+                         targets: torch.Tensor, old_values: torch.Tensor) -> int:
+        """rl_games' PPO epoch per hand (DexMachina's rl_games: a2c_common.ContinuousA2CBase.train_epoch +
+        a2c_continuous.calc_gradients, schedule_type standard, permute off). ``num_learning_epochs`` passes; each
+        pass walks ``num_mini_batches`` minibatches in a fixed order, minibatch i = envs [i E, (i + 1) E) with all
+        their window rows (rl_games' contiguous slices of the env-major flattened batch). Per minibatch and hand:
+        loss = clipped surrogate + value_loss_coef * value loss - entropy_coef * entropy + bounds_loss_coef * bound
+        loss (rl_games' order; value_loss_coef 2 = 0.5 * critic_coef 4), the value loss clipped around the rollout's
+        normalized values only with ``clip_value``; one gradient-norm clip over the hand's actor and critic, one Adam
+        step; KL = rl_games' policy_kl(new = the pre-step means / stds, ref = the rows' recorded means / stds), then the
+        rows' reference is overwritten with the pre-step means / stds (dataset.update_mu_sigma). After each pass the
+        hand's LR follows AdaptiveScheduler on the mean KL of the pass. Returns the number of minibatch steps."""
+        T, N, H, D = self.window, self.num_envs, self.H, self.obs.shape[-1]
+        E = N // self.num_mb
+        adv = adv.view(T, N, H)
+        targets = targets.view(T, N, H)
+        old_values = old_values.view(T, N, H)
+        mu_ref = self.mu.clone()
+        sigma_ref = self.sigma.clone()
+        n_updates = 0
+        for ep in range(self.epochs):
+            pass_kls: list[list[torch.Tensor]] = [[] for _ in range(H)]
+            for i in range(self.num_mb):
+                sl = slice(i * E, (i + 1) * E)
+                o = self.obs[:, sl].reshape(T * E, D)
+                act = self.actions[:, sl].reshape(T * E, self.action_dim)
+                for h in range(H):
+                    ids = self.ids[h]
+                    k = len(ids)
+                    dist = self.actors[h].distribution(o)
+                    mu_new = dist.mean
+                    sigma_new = dist.stddev.expand_as(mu_new)
+                    logp = dist.log_prob(act[:, ids]).sum(-1)
+                    ratio = torch.exp(logp - self.logp[:, sl, h].reshape(-1))
+                    a_h = adv[:, sl, h].reshape(-1)
+                    surrogate = torch.max(-a_h * ratio,
+                                          -a_h * ratio.clamp(1.0 - self.clip_param, 1.0 + self.clip_param)).mean()
+                    v = self.critics[h](o)
+                    ret = targets[:, sl, h].reshape(-1)
+                    if self.clip_value:   # rl_games common_losses.default_critic_loss
+                        v0 = old_values[:, sl, h].reshape(-1)
+                        v_clip = v0 + (v - v0).clamp(-self.clip_param, self.clip_param)
+                        value_loss = torch.max((v - ret).square(), (v_clip - ret).square()).mean()
+                    else:
+                        value_loss = (ret - v).square().mean()
+                    s = self.bounds_soft
+                    bounds = ((mu_new - s).clamp_min(0.0).square() + (mu_new + s).clamp_max(0.0).square()).sum(-1).mean()
+                    entropy = dist.entropy().sum(-1).mean()
+                    loss = surrogate + self.vf_coef * value_loss - self.ent_coef * entropy + self.bounds_coef * bounds
+                    self.optimizers[h].zero_grad(set_to_none=True)
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(list(self.actors[h].parameters()) + list(self.critics[h].parameters()),
+                                             self.max_grad_norm)
+                    self.optimizers[h].step()
+                    with torch.no_grad():
+                        m_new, s_new = mu_new.detach(), sigma_new.detach()
+                        m_ref = mu_ref[:, sl, ids].reshape(T * E, k)
+                        s_ref = sigma_ref[:, sl, ids].reshape(T * E, k)
+                        # rl_games torch_ext.policy_kl(p0 = new, p1 = ref): KL(new || ref)
+                        kl = (torch.log(s_ref / s_new + 1e-5)
+                              + (s_new.square() + (m_ref - m_new).square()) / (2.0 * (s_ref.square() + 1e-5))
+                              - 0.5).sum(-1).mean()
+                        pass_kls[h].append(kl)
+                        mu_ref[:, sl, ids] = m_new.view(T, E, k)
+                        sigma_ref[:, sl, ids] = s_new.view(T, E, k)
+                        if ep == self.epochs - 1:   # diagnostic: vs the rows' collecting policy
+                            m0 = self.mu[:, sl, ids].reshape(T * E, k)
+                            s0 = self.sigma[:, sl, ids].reshape(T * E, k)
+                            kl_rollout[h] += float((torch.log(s0 / s_new + 1e-5)
+                                                    + (s_new.square() + (m0 - m_new).square())
+                                                    / (2.0 * (s0.square() + 1e-5)) - 0.5).sum(-1).mean())
+                    stats["surrogate"][h] += float(surrogate)
+                    stats["value"][h] += float(value_loss)
+                    stats["bounds"][h] += float(bounds)
+                    stats["entropy"][h] += float(entropy)
+                    stats["kl"][h] += float(kl)
+                    stats["clip_frac"][h] += float(((ratio - 1.0).abs() > self.clip_param).float().mean())
+                n_updates += 1
+            if self.schedule == "adaptive":   # rl_games AdaptiveScheduler, once per pass on the pass's mean KL
+                for h in range(H):
+                    av = torch.mean(torch.stack(pass_kls[h])).item()   # torch_ext.mean_list
+                    lr = self.lrs[h]
+                    if av > 2.0 * self.desired_kl:
+                        lr = max(lr / 1.5, 1e-6)
+                    if av < 0.5 * self.desired_kl:
+                        lr = min(lr * 1.5, 1e-2)
+                    self.lrs[h] = lr
+                    for g in self.optimizers[h].param_groups:
+                        g["lr"] = lr
+        return n_updates
+
+    def _update_rsl_rl(self, stats: dict[str, list[float]], B: int, obs: torch.Tensor, actions: torch.Tensor,
+                       mu_old: torch.Tensor, sigma_old: torch.Tensor, logp_old: torch.Tensor, adv: torch.Tensor,
+                       targets: torch.Tensor) -> int:
+        """The rsl_rl-style epoch (impl=rsl_rl): random row minibatches, per-minibatch adaptive LR on the KL to the
+        rollout policy, gradient clipping per network. Returns the number of minibatch steps."""
         mb = B // self.num_mb
         n_updates = 0
         for _ in range(self.epochs):
@@ -359,45 +537,7 @@ class HandPPOAgent(Agent):
                     stats["entropy"][h] += float(entropy)
                     stats["clip_frac"][h] += float(((ratio - 1.0).abs() > self.clip_param).float().mean())
                 n_updates += 1
-
-        # observation normalizers: the fresh rows only (the carried rows were counted when they were fresh)
-        fresh = self.obs[self._carried_now:].flatten(0, 1)
-        with torch.no_grad():
-            for h in range(self.H):
-                self.actors[h].update_normalization(fresh)
-                self.critics[h].update_normalization(fresh)
-        self._have_prev = True
-        t_update = time.perf_counter() - t0
-        t_cache = 0.0
-        if self.empty_cache and torch.cuda.is_available():
-            t1 = time.perf_counter()
-            torch.cuda.empty_cache()
-            t_cache = time.perf_counter() - t1
-
-        out: dict[str, float] = {}
-        for h, name in enumerate(self.sides):
-            for k, v in stats.items():
-                if k == "kl" and self.schedule != "adaptive":
-                    continue
-                out[f"loss/{k}_{name}" if k in ("surrogate", "value", "bounds", "entropy") else f"train/{k}_{name}"] = \
-                    v[h] / n_updates
-            out[f"train/learning_rate_{name}"] = self.lrs[h]
-            if self.critic_optimizers:
-                out[f"train/critic_lr_{name}"] = float(self.critic_optimizers[h].param_groups[0]["lr"])
-            out[f"train/action_std_{name}"] = float(self.actors[h].std().mean())
-            out[f"train/return_mean_{name}"] = float(returns[:, h].mean())
-            if self.normalize_value:
-                out[f"train/value_rms_mean_{name}"] = float(self.value_rms[h].running_mean)
-                out[f"train/value_rms_std_{name}"] = float(self.value_rms[h].running_var.sqrt())
-        out.update({
-            "train/learning_rate": float(np.mean(self.lrs)),
-            "train/action_std": float(np.mean([float(self.actors[h].std().mean()) for h in range(self.H)])),
-            "train/carried_rows": float(self._carried_now),
-            "train/window_rows": float(self.window),
-            "train/update_time_s": t_update,
-            "train/empty_cache_s": t_cache,
-        })
-        return out
+        return n_updates
 
     def on_env_reset(self) -> None:
         """The runner reset the train envs (eval drove them): the previous window is no longer contiguous."""

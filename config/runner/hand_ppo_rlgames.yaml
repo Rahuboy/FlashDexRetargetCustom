@@ -1,0 +1,36 @@
+# @package _global_
+
+# Per-hand PPO with DexMachina's rl_games PPO update (FDR-26 / FDR-27): config/runner/hand_ppo.yaml (per-hand actors and
+# critics on per-hand reward heads, trajectory encoders, observation normalization, rewards x0.1, value normalization,
+# bound loss, entropy 0) with, from DexMachina's rl_games recipe (dexmachina/rl/configs/rl_games_ppo_cfg.yaml and the
+# paper runs' configs):
+#   - algorithm.impl=rl_games: rl_games' PPO epoch (agents.hand_ppo._update_rl_games), value-loss clipping OFF;
+#   - actor and critic MLPs [512, 512, 256, 128] ELU, kept separate (DexMachina: one shared trunk), rl_games init (zero
+#     biases) and rl_games' log-std parameter (init std 1 = log std 0, as DexMachina's sigma_init const 0);
+#   - horizon 32 (num_steps_per_env), 4 minibatches x 14 passes per iteration (DexMachina: 32 x 12,000 rows / 96,000);
+#   - adaptive LR from 3e-4 with kl_threshold 0.008.
+# PPO+RAgger as DexMachina's prevbuf32_H64: runner.agent.carry_steps=32 (window 64 = 32 carried + 32 fresh, all trained).
+# max_epochs 15,000 x 32 x 8,192 envs = 3.93B env steps (= FDR-18's 20,000 x 24 x 8,192).
+defaults:
+  - hand_ppo
+  - _self_
+
+max_epochs: 15000
+
+runner:
+  agent:
+    num_steps_per_env: 32
+    actor:
+      hidden_dims: [512, 512, 256, 128]
+      std_type: log
+      init: rl_games
+    critic:
+      hidden_dims: [512, 512, 256, 128]
+      init: rl_games
+    algorithm:
+      impl: rl_games
+      clip_value: false
+      num_learning_epochs: 14
+      num_mini_batches: 4
+      learning_rate: 3.0e-4
+      desired_kl: 0.008

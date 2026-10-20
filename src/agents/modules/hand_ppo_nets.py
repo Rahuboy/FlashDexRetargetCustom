@@ -3,10 +3,11 @@
 Both are rsl_rl's MLPModel layout with the 1D-conv FutureTrajEncoder in front: a running observation normalizer
 (rsl_rl EmpiricalNormalization) over every input dim, then the encoder over the future-trajectory window at the obs
 tail (each network has its own encoder; the window is replaced by its latent), then the trunk: rsl_rl's MLP (``arch:
-mlp``; PyTorch default init, as rsl_rl's MLPModel) or the SimBa residual trunk of the alphanist paper (``arch: simba``,
-SimbaTrunk). The actor's trunk outputs the means of its hand's action dims; its std is rsl_rl's GaussianDistribution
-with std_type "scalar" (a learned state-independent std per dim, clamped to [1e-6, 1e6]). The critic's trunk outputs
-one value (in normalized units when agents.hand_ppo normalizes values).
+mlp``; PyTorch default init, as rsl_rl's MLPModel; ``init: rl_games`` zeroes its biases as rl_games' default
+initializer does) or the SimBa residual trunk of the alphanist paper (``arch: simba``, SimbaTrunk). The actor's trunk
+outputs the means of its hand's action dims; its std is rsl_rl's GaussianDistribution with std_type "scalar" (a learned
+state-independent std per dim, clamped to [1e-6, 1e6]) or, with ``std_type: log``, rl_games' learned log std. The
+critic's trunk outputs one value (in normalized units when agents.hand_ppo normalizes values).
 """
 
 from __future__ import annotations
@@ -86,10 +87,20 @@ class _EncodedMLP(nn.Module):
         self.traj = FutureTrajEncoder(traj_cfg) if traj_cfg else None
         d_in = obs_dim if self.traj is None else obs_dim - self.traj.window_width + self.traj.latent_dim
         arch = str(cfg.get("arch", "mlp"))
+        init = str(cfg.get("init", "rsl_rl"))
+        if init not in ("rsl_rl", "rl_games"):
+            raise ValueError(f"init must be 'rsl_rl' or 'rl_games', got {init!r}")
         if arch == "mlp":
             self.mlp = MLP(d_in, out_dim, [int(h) for h in cfg.get("hidden_dims", [256, 256, 256])],
                            str(cfg.get("activation", "elu")))
+            if init == "rl_games":
+                # rl_games' 'default' initializer: PyTorch default weights, zero biases (every Linear incl. the head)
+                for m in self.mlp.modules():
+                    if isinstance(m, nn.Linear) and m.bias is not None:
+                        nn.init.zeros_(m.bias)
         elif arch == "simba":
+            if init != "rsl_rl":
+                raise ValueError("init=rl_games applies to arch=mlp only")
             self.mlp = SimbaTrunk(d_in, out_dim, cfg["simba"])
         else:
             raise ValueError(f"arch must be 'mlp' or 'simba' here, got {arch!r}")
@@ -104,16 +115,27 @@ class _EncodedMLP(nn.Module):
 
 
 class HandActor(_EncodedMLP):
-    """One hand's policy: means from the encoded MLP, learned state-independent std (rsl_rl scalar std)."""
+    """One hand's policy: means from the encoded MLP, learned state-independent std: ``std_type`` scalar = rsl_rl's
+    (the parameter is the std, clamped to [1e-6, 1e6]); log = rl_games' continuous_a2c_logstd with fixed_sigma (the
+    parameter is log std, init log(init_std), std = exp, no clamp)."""
 
     def __init__(self, obs_dim: int, action_dim: int, traj_cfg: dict[str, Any] | None, cfg: dict[str, Any]) -> None:
         super().__init__(obs_dim, action_dim, traj_cfg, cfg)
-        self.std_param = nn.Parameter(float(cfg.get("init_std", 1.0)) * torch.ones(action_dim))
+        self.std_type = str(cfg.get("std_type", "scalar"))
+        init_std = float(cfg.get("init_std", 1.0))
+        if self.std_type == "scalar":
+            self.std_param = nn.Parameter(init_std * torch.ones(action_dim))
+        elif self.std_type == "log":
+            self.log_std_param = nn.Parameter(math.log(init_std) * torch.ones(action_dim))
+        else:
+            raise ValueError(f"std_type must be 'scalar' or 'log', got {self.std_type!r}")
 
     def mean(self, obs: torch.Tensor) -> torch.Tensor:
         return self.mlp(self.features(obs))
 
     def std(self) -> torch.Tensor:
+        if self.std_type == "log":
+            return torch.exp(self.log_std_param)
         return self.std_param.clamp(*_STD_RANGE)
 
     def distribution(self, obs: torch.Tensor) -> Normal:

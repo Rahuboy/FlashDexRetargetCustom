@@ -8,6 +8,8 @@
 #     normalization (DexMachina); rl_games' bound loss on the action means (soft bound 1.1, coef 1e-4, DexMachina);
 #   - a separate Adam optimizer and adaptive learning rate per hand (rsl_rl's rule on that hand's KL).
 # actor.arch / critic.arch = simba: the alphanist (SimBa) residual trunk in place of the MLP (FDR-16/17).
+# algorithm.impl = rl_games: DexMachina's rl_games PPO update per hand (agents.hand_ppo._update_rl_games; FDR-26/27,
+# recipe config/runner/hand_ppo_rlgames.yaml).
 # PPO+RAgger: runner.agent.carry_steps=<rows carried> (0 = plain PPO).
 defaults:
   - base
@@ -51,6 +53,8 @@ runner:
       activation: elu
       obs_normalization: true
       init_std: 1.0              # rsl_rl GaussianDistribution, std_type scalar
+      std_type: scalar           # scalar: the std is the parameter (rsl_rl) | log: log std (rl_games fixed_sigma logstd)
+      init: rsl_rl               # arch mlp: rsl_rl (PyTorch default) | rl_games (PyTorch default weights, zero biases)
       simba:                     # arch: simba only — alphanist Fig. 3 trunk after [normalized obs | trajectory latent]:
         hidden_dim: 256          #   linear 256 -> num_blocks x [LN -> linear 4x256 -> Swish -> linear 256, + skip] -> LN -> linear
         num_blocks: 2
@@ -63,6 +67,7 @@ runner:
       hidden_dims: [256, 256, 256]
       activation: elu
       obs_normalization: true
+      init: rsl_rl               # as the actor's
       simba:                     # arch: simba only — as the actor's, value head at SimBa's orthogonal gain 1
         hidden_dim: 256
         num_blocks: 2
@@ -85,6 +90,9 @@ runner:
       lr_decay_updates: ${eval:'${max_epochs} * ${runner.agent.algorithm.num_learning_epochs} * ${runner.agent.algorithm.num_mini_batches}'}
 
     algorithm:
+      impl: rsl_rl               # rsl_rl (FDR-10..25) | rl_games: DexMachina's rl_games PPO epoch (fixed env-block minibatches,
+                                 #   KL reference refreshed per minibatch, LR stepped per pass in [1e-6, 1e-2], joint grad clip)
+      clip_value: false          # impl=rl_games only: rl_games' value-loss clip (+-clip_param around the rollout values)
       num_learning_epochs: 5
       num_mini_batches: 4
       clip_param: 0.2

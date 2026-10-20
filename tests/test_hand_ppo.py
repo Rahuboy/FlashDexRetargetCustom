@@ -270,4 +270,96 @@ n_sb = sum(p.numel() for p in sb.actors[0].mlp.parameters())
 print(f"12. simba trunk: embed {FLAT + lat}->32, 2 x [LN, 32->128 SiLU ->32, +skip], LN, head; SimBa init (orthogonal embed, "
       f"truncated He blocks, head gain 0.01 / 1), initial |mean| max {float(m0.abs().max()):.4f}, joint Adam, 2 updates "
       f"finite, save/load exact ({n_sb} trunk params)  OK")
+
+# ── 13. algorithm.impl=rl_games: env-block minibatches in a fixed order, LR stepped once per pass, KL reference
+#        refreshed per minibatch, time-out bootstrap baked into the stored reward, log std, zero-bias init ──
+def make_rlg(carry=0, seed=0, clip_value=False, epochs=3):
+    cfg = OmegaConf.load(Path(__file__).resolve().parents[1] / "config/runner/hand_ppo.yaml").runner.agent
+    rl = OmegaConf.load(Path(__file__).resolve().parents[1] / "config/runner/hand_ppo_rlgames.yaml").runner.agent
+    cfg = OmegaConf.merge(cfg, rl, {"device": "cpu", "num_steps_per_env": T, "carry_steps": carry,
+                                    "actor": {"hidden_dims": [32, 16]}, "critic": {"hidden_dims": [32, 16]},
+                                    "algorithm": {"num_learning_epochs": epochs, "clip_value": clip_value},
+                                    "empty_cache_after_update": False})
+    torch.manual_seed(seed)
+    return HandPPOAgent(cfg, D, SIDES, IDS, N, TRAJ, "cpu")
+
+
+rg = make_rlg(seed=21)
+assert rg.impl == "rl_games" and rg.epochs == 3 and rg.num_mb == 4 and rg.lrs == [3e-4, 3e-4] and rg.desired_kl == 0.008
+for h in range(H):
+    assert torch.equal(rg.actors[h].std(), torch.ones(len(IDS[h]))) and not hasattr(rg.actors[h], "std_param")
+    for net in (rg.actors[h], rg.critics[h]):
+        lin = [m for m in net.mlp.modules() if isinstance(m, torch.nn.Linear)]
+        assert [m.out_features for m in lin][:2] == [32, 16] and all(torch.count_nonzero(m.bias) == 0 for m in lin)
+        assert all(float(m.weight.abs().sum()) > 0 for m in lin)
+rg.begin_rollout()
+obs0 = rng.standard_normal((N, D)).astype(np.float32)
+raw_r, trunc_ = [], []
+for t in range(T):
+    rg.act(obs0)
+    v_t = rg._pending["values"].clone()
+    obs0 = rng.standard_normal((N, D)).astype(np.float32)
+    r = rng.standard_normal((N, H)).astype(np.float32)
+    tr = rng.random(N) < 0.2
+    rg.observe({"reward": r, "terminated": rng.random(N) < 0.05, "truncated": tr, "next_observation": obs0})
+    exp_r = torch.as_tensor(r) * 0.1 + rg.gamma * v_t * torch.as_tensor(tr).float().unsqueeze(-1)
+    assert torch.allclose(rg.rewards[t], exp_r, atol=1e-6), t
+ret_, adv_ = rg._returns()
+with torch.no_grad():
+    Vl = rg._values(rg._last_obs)
+ref_a = torch.zeros_like(Vl)
+ref = torch.zeros_like(rg.values)
+for t in reversed(range(T)):                     # GAE with no second time-out bootstrap (it is in the stored reward)
+    nv = Vl if t == T - 1 else rg.values[t + 1]
+    nd = (~rg.dones[t]).float().unsqueeze(-1)
+    ref_a = rg.rewards[t] + nd * rg.gamma * nv - rg.values[t] + nd * rg.gamma * rg.lam * ref_a
+    ref[t] = ref_a + rg.values[t]
+assert torch.allclose(ret_, ref, atol=1e-5)
+# record what every actor call sees and the LR at every optimizer step
+E = N // rg.num_mb
+seen, lrs_at_step = [], []
+orig_dist = rg.actors[0].distribution
+rg.actors[0].distribution = lambda o: (seen.append(o.clone()), orig_dist(o))[1]
+orig_step = rg.optimizers[0].step
+rg.optimizers[0].step = lambda *a_, **k_: (lrs_at_step.append(rg.optimizers[0].param_groups[0]["lr"]), orig_step(*a_, **k_))[1]
+kl_seen = []
+info = rg.update()
+rg.actors[0].distribution = orig_dist
+rg.optimizers[0].step = orig_step
+assert len(seen) == rg.epochs * rg.num_mb
+for ep in range(rg.epochs):
+    for i in range(rg.num_mb):
+        exp_o = rg.obs[:, i * E:(i + 1) * E].reshape(-1, D)
+        assert torch.equal(seen[ep * rg.num_mb + i], exp_o), (ep, i)
+per_pass = [lrs_at_step[ep * rg.num_mb:(ep + 1) * rg.num_mb] for ep in range(rg.epochs)]
+assert all(len(set(pp)) == 1 for pp in per_pass), per_pass       # the LR moves only between passes
+assert per_pass[0][0] == 3e-4
+for k in ("train/kl_right", "train/kl_rollout_left", "train/learning_rate_left", "loss/value_right"):
+    assert k in info and np.isfinite(info[k]), k
+# the per-pass KL (reference refreshed) is below the KL to the rollout policy after several passes
+assert info["train/kl_rollout_right"] > info["train/kl_right"] * 0.99, (info["train/kl_rollout_right"], info["train/kl_right"])
+# carry + clip_value variants run; default impl rejects clip_value
+rc = make_rlg(carry=3, seed=22, clip_value=True)
+for it in range(2):
+    n_ = rc.begin_rollout()
+    rollout(rc, rng, n_)
+    inf = rc.update()
+assert inf["train/carried_rows"] == 3.0 and np.isfinite(inf["loss/value_left"])
+try:
+    bad = OmegaConf.merge(OmegaConf.load(Path(__file__).resolve().parents[1] / "config/runner/hand_ppo.yaml").runner.agent,
+                          {"device": "cpu", "algorithm": {"clip_value": True}})
+    HandPPOAgent(bad, D, SIDES, IDS, N, TRAJ, "cpu")
+    raise AssertionError("clip_value accepted with impl=rsl_rl")
+except ValueError:
+    pass
+with tempfile.TemporaryDirectory() as d:
+    rg.save(d)
+    rg2 = make_rlg(seed=23)
+    rg2.load(d)
+    xx = torch.as_tensor(rng.standard_normal((32, D)).astype(np.float32))
+    with torch.no_grad():
+        assert torch.equal(rg2.actors[0].mean(xx), rg.actors[0].mean(xx)) and torch.equal(rg2.actors[1].std(), rg.actors[1].std())
+print(f"13. impl=rl_games: {rg.epochs} passes x {rg.num_mb} env blocks ({E} envs x {T} rows) in fixed order, LR per pass "
+      f"{[pp[0] for pp in per_pass]}, kl {info['train/kl_right']:.2e} vs kl_rollout {info['train/kl_rollout_right']:.2e}, "
+      f"time-out bootstrap in the stored reward, log std 1.0, zero biases, carry + clip_value run, save/load exact  OK")
 print("ALL OK")
