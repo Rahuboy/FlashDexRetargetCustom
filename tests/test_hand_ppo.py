@@ -368,7 +368,7 @@ from torch.distributions import Categorical  # noqa: E402
 cat = make(actor={"dist": "categorical", "num_bins": 11, "eps": 0.01}, seed=31)
 assert cat.categorical and cat.num_bins == 11 and cat.probs.shape == (T, N, A, 11)
 vals = cat.actors[0].bin_values
-assert torch.allclose(vals, torch.linspace(-1, 1, 11)) and float(vals[5]) == 0.0
+assert torch.allclose(vals, torch.linspace(-1, 1, 11), atol=1e-6) and float(vals[5]) == 0.0 and float(vals[0]) == -1.0
 xx = torch.as_tensor(rng.standard_normal((64, D)).astype(np.float32))
 with torch.no_grad():
     d0 = cat.actors[0].distribution(xx)
