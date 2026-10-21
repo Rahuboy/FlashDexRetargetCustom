@@ -674,18 +674,29 @@ class HandPPOAgent(Agent):
         (rsl_rl recurrent_mini_batch_generator: the same order every epoch); per minibatch and hand the actor and critic
         run over the padded trajectories from their start states and return to the (T, E) layout; then the losses,
         the adaptive LR on the KL to the rollout policy, and the per-network gradient clipping of _update_rsl_rl.
-        Returns the number of minibatch steps."""
+        Memory (FDR-35's first launch died of CUDA OOM at its first update): each minibatch's trajectories are padded
+        when it is used (split_and_pad_trajectories of the env block = the block's slice of the whole-window padding:
+        trajectories are per env, both pad to T), and the actor and critic losses are backpropagated one after the other
+        (separate networks, no shared parameters: the same gradients as one backward of their sum), so only one
+        network's graph is alive at a time. Returns the number of minibatch steps."""
+        from rsl_rl.utils import split_and_pad_trajectories
+
         T, N, H = self.window, self.num_envs, self.H
         E = N // self.num_mb
         adv = adv.view(T, N, H)
         targets = targets.view(T, N, H)
-        padded, masks, env_idx, t_idx, offsets = self._trajectories()
+        starts = torch.zeros_like(self.dones)
+        starts[0] = True
+        starts[1:] = self.dones[:-1]
+        env_idx, t_idx = starts.transpose(0, 1).nonzero(as_tuple=True)
+        offsets = torch.cat([starts.new_zeros(1, dtype=torch.long), starts.sum(0).cumsum(0)])
         n_updates = 0
         for _ in range(self.epochs):
             for i in range(self.num_mb):
                 tr = slice(int(offsets[i * E]), int(offsets[(i + 1) * E]))
                 sl = slice(i * E, (i + 1) * E)
-                o, mk, ei, ti = padded[:, tr], masks[:, tr], env_idx[tr], t_idx[tr]
+                o, mk = split_and_pad_trajectories(self.obs[:, sl], self.dones[:, sl].unsqueeze(-1))
+                ei, ti = env_idx[tr], t_idx[tr]
                 for h in range(H):
                     ids = self.ids[h]
                     lat = self.actors[h].latent_seq(o, mk, self._start_states(self._h0_a[h], ei, ti)).flatten(0, 1)
@@ -711,15 +722,15 @@ class HandPPOAgent(Agent):
                     a_h = adv[:, sl, h].flatten()
                     surrogate = torch.max(-a_h * ratio,
                                           -a_h * ratio.clamp(1.0 - self.clip_param, 1.0 + self.clip_param)).mean()
-                    lat_c = self.critics[h].latent_seq(o, mk, self._start_states(self._h0_c[h], ei, ti)).flatten(0, 1)
-                    v = self.critics[h].value_from_latent(lat_c)
-                    value_loss = (targets[:, sl, h].flatten() - v).square().mean()
                     s = self.bounds_soft
                     bounds = ((mu_new - s).clamp_min(0.0).square() + (mu_new + s).clamp_max(0.0).square()).sum(-1).mean()
                     entropy = dist.entropy().sum(-1).mean()
-                    loss = surrogate + self.vf_coef * value_loss + self.bounds_coef * bounds - self.ent_coef * entropy
                     self.optimizers[h].zero_grad(set_to_none=True)
-                    loss.backward()
+                    (surrogate + self.bounds_coef * bounds - self.ent_coef * entropy).backward()   # frees the actor graph
+                    lat_c = self.critics[h].latent_seq(o, mk, self._start_states(self._h0_c[h], ei, ti)).flatten(0, 1)
+                    v = self.critics[h].value_from_latent(lat_c)
+                    value_loss = (targets[:, sl, h].flatten() - v).square().mean()
+                    (self.vf_coef * value_loss).backward()
                     nn.utils.clip_grad_norm_(self.actors[h].parameters(), self.max_grad_norm)
                     nn.utils.clip_grad_norm_(self.critics[h].parameters(), self.max_grad_norm)
                     self.optimizers[h].step()
