@@ -21,6 +21,8 @@ from rsl_rl.modules.mlp import MLP
 from rsl_rl.modules.normalization import EmpiricalNormalization
 from torch.distributions import Normal
 
+from common import distributed
+
 from .traj_encoder import FutureTrajEncoder
 
 _STD_RANGE = (1e-6, 1e6)   # rsl_rl GaussianDistribution's default clamp for std_type "scalar"
@@ -298,7 +300,8 @@ class FlashSACValueCritic(nn.Module):
 class ValueRMS(nn.Module):
     """rl_games' RunningMeanStd for one value head (DexMachina's ``normalize_value``): float64 running mean/var
     with count initialized to 1, unbiased batch variance, epsilon 1e-5, outputs clamped to [-5, 5]; ``denorm``
-    clamps the input to [-5, 5] first. ``update`` = rl_games' forward in train mode (stats only)."""
+    clamps the input to [-5, 5] first. ``update`` = rl_games' forward in train mode (stats only); multi-GPU, the batch is
+    every rank's rows (as rsl_rl's EmpiricalNormalization)."""
 
     def __init__(self, epsilon: float = 1e-5) -> None:
         super().__init__()
@@ -311,6 +314,8 @@ class ValueRMS(nn.Module):
     def update(self, x: torch.Tensor) -> None:
         x = x.reshape(-1)
         b_mean, b_var, b_count = x.mean().double(), x.var().double(), float(x.numel())
+        if distributed.active():
+            b_count, b_mean, b_var = distributed.combine_moments(x.numel(), b_mean, b_var)
         delta = b_mean - self.running_mean
         tot = self.count + b_count
         new_mean = self.running_mean + delta * b_count / tot

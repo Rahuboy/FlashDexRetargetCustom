@@ -1,5 +1,7 @@
 #!/bin/bash
-# MOTION=<motion.pt> [ROBOT=xhand|sharpa] bash scripts/train_flashdexretarget.sh [hydra overrides ...]
+# MOTION=<motion.pt> [ROBOT=xhand|sharpa] [NPROC=<gpus>] bash scripts/train_flashdexretarget.sh [hydra overrides ...]
+# NPROC > 1: data-parallel over that many GPUs (torchrun; src/common/distributed.py): num_envs envs per GPU, rank 0
+# logs, evaluates and checkpoints, the other ranks' output goes to logs/torchrun/.
 set -e
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 source scripts/env.sh
@@ -23,4 +25,8 @@ args+=(
 )
 for ov in "$@"; do args+=(--overrides "$ov"); done
 
+if [ "${NPROC:-1}" -gt 1 ]; then
+    exec torchrun --standalone --nproc_per_node="$NPROC" --log-dir logs/torchrun \
+        --redirects "$(seq -s, -f '%g:3' 1 $((NPROC - 1)))" train.py "${args[@]}"
+fi
 python train.py "${args[@]}"

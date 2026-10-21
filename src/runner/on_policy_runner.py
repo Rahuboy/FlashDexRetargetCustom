@@ -2,7 +2,8 @@
 logging as OffPolicyRunner. One iteration = one rollout (every action from the policy, including right after a
 reset) + one update. Eval and checkpoints run at the end of the iteration in which their absolute env-step grid
 point is crossed (at most one rollout late); after an eval drove the train envs they are reset and the agent
-starts a fresh window."""
+starts a fresh window. Multi-GPU (common.distributed): env steps count every rank's envs, rank 0 alone evaluates (on its
+own envs), logs and checkpoints, and the ranks stop together."""
 
 from __future__ import annotations
 
@@ -10,6 +11,7 @@ import numpy as np
 import tqdm
 from omegaconf import DictConfig
 
+from common import distributed
 from common.average_meters import AverageMeter
 from common.logger import log_metrics
 
@@ -21,6 +23,7 @@ class OnPolicyRunner(OffPolicyRunner):
         super().__init__(env, runner_cfg, eval_cfg, eval_env, headless=headless)
         self._max_iterations = int(runner_cfg.max_epochs)
         self._log_every_it = max(1, int(runner_cfg.get("log_every_iterations", 1)))
+        self._step_envs = self._n_envs * distributed.world_size()   # env steps per vector step, every rank's envs
 
     @staticmethod
     def _crossed_range(prev_step: int, env_step: int, stride: int) -> bool:
@@ -39,17 +42,20 @@ class OnPolicyRunner(OffPolicyRunner):
             prev_step = env_step
             for _ in range(agent.begin_rollout()):
                 self._collect_on_policy(it, meter)
-                env_step += self._n_envs
+                env_step += self._step_envs
             meter.update(agent.update())
 
             if self._crossed_range(prev_step, env_step, self._eval_stride) and self._eval_supported():
-                eval_metrics = self._run_eval(env_step)
-                log_metrics({**eval_metrics, **self._cost_metrics(env_step), "train/iteration": it + 1},
-                            step=env_step)
-                if getattr(self._eval_env, "shares_train_env", False):
-                    self._reset_train_env()   # eval drove the train env: restart its episodes
-                    agent.on_env_reset()
-                if self._all_solved(eval_metrics, env_step):
+                solved = False
+                if distributed.is_main():   # the other ranks wait for it at their next collective
+                    eval_metrics = self._run_eval(env_step)
+                    log_metrics({**eval_metrics, **self._cost_metrics(env_step), "train/iteration": it + 1},
+                                step=env_step)
+                    if getattr(self._eval_env, "shares_train_env", False):
+                        self._reset_train_env()   # eval drove the train env: restart its episodes
+                        agent.on_env_reset()
+                    solved = self._all_solved(eval_metrics, env_step)
+                if distributed.any_(solved):
                     solved_stop = True
                     break
 
@@ -61,10 +67,10 @@ class OnPolicyRunner(OffPolicyRunner):
             if self._crossed_range(prev_step, env_step, self._save_stride):
                 self._save_checkpoint(env_step)
 
-            if self._stop_requested:
+            if distributed.any_(self._stop_requested):
                 self._graceful_stop(env_step)
 
-        if self._eval_supported() and not solved_stop:
+        if self._eval_supported() and not solved_stop and distributed.is_main():
             log_metrics({**self._run_eval(env_step), **self._cost_metrics(env_step)}, step=env_step)
         self._finish()
 

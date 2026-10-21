@@ -21,6 +21,12 @@ def run(args: argparse.Namespace) -> None:
     config_dir = (Path(__file__).resolve().parent / args.config_path).resolve()
     with hydra.initialize_config_dir(version_base=None, config_dir=str(config_dir)):
         cfg = hydra.compose(config_name=args.config_name, overrides=args.overrides)
+    # torchrun (WORLD_SIZE > 1): data-parallel over GPUs, one process each (common.distributed); rank r drives GPU
+    # LOCAL_RANK with seed + r
+    multi_gpu = int(os.environ.get("WORLD_SIZE", "1")) > 1
+    if multi_gpu:
+        cfg.device = f"cuda:{os.environ['LOCAL_RANK']}"
+        cfg.seed = int(cfg.seed) + int(os.environ["RANK"])
     OmegaConf.resolve(cfg)
 
     # ─── Isaac Sim app (boots before torch-heavy imports) ─────────────────
@@ -28,13 +34,16 @@ def run(args: argparse.Namespace) -> None:
     from isaaclab.app import AppLauncher
 
     headless = bool(cfg.get("headless", True))
-    AppLauncher({"headless": headless})
+    AppLauncher({"headless": headless, **({"distributed": True} if multi_gpu else {})})
 
+    from common import distributed
     from common.logger import setup_logger
     from common.utils import configure_torch_backends, set_seed
     from envs import create_envs
     from runner import create_runner
 
+    if multi_gpu:
+        distributed.init(cfg.device)
     set_seed(cfg.seed)
     configure_torch_backends()
 
@@ -43,6 +52,7 @@ def run(args: argparse.Namespace) -> None:
     setup_logger(cfg.logger, cfg.runner)
     runner = create_runner(cfg.runner, cfg.eval, train_env, eval_env=eval_env, headless=headless)
     runner.learn(num_learning_iterations=int(cfg.runner.max_iterations), init_at_random_ep_len=True)
+    distributed.shutdown()
 
     train_env.close()
     eval_env.close()

@@ -17,6 +17,7 @@ from mjlab.rl import RslRlVecEnvWrapper
 from omegaconf import DictConfig, OmegaConf
 
 from agents import build_agent
+from common import distributed
 from common.average_meters import AverageMeter
 from common.logger import log_metrics
 from envs.vec_env import FlatObsVecEnv
@@ -300,7 +301,9 @@ class OffPolicyRunner:
 
     def _save_checkpoint(self, env_step: int) -> None:
         """Written to .tmp and renamed, so a failed write (e.g. full GPFS) leaves no corrupt
-        step dir; a failure is logged and training continues."""
+        step dir; a failure is logged and training continues. Multi-GPU: rank 0 writes the (shared) agent."""
+        if not distributed.is_main():
+            return
         base = self._save_path_base
         tmp, ckpt = base / f"step{env_step}.tmp", base / f"step{env_step}"
         save_buffer = bool(self._cfg.get("save_replay_buffer", False))
@@ -348,11 +351,12 @@ class OffPolicyRunner:
             pass
 
     def _graceful_stop(self, env_step: int) -> None:
-        ckpt = self._save_path_base / f"stop{env_step}"
-        self._agent.save(str(ckpt))
-        self._agent.save_buffer(str(ckpt))
-        self._log_resume_state(ckpt, env_step)
-        print(f"[runner] graceful stop at env_step={env_step}: {ckpt}", flush=True)
+        if distributed.is_main():   # multi-GPU: rank 0 writes the checkpoint, every rank exits
+            ckpt = self._save_path_base / f"stop{env_step}"
+            self._agent.save(str(ckpt))
+            self._agent.save_buffer(str(ckpt))
+            self._log_resume_state(ckpt, env_step)
+            print(f"[runner] graceful stop at env_step={env_step}: {ckpt}", flush=True)
         try:
             wandb.finish()
         except Exception:  # noqa: BLE001
@@ -360,6 +364,8 @@ class OffPolicyRunner:
         os._exit(0)
 
     def _finish(self) -> None:
+        if not distributed.is_main():   # multi-GPU: rank 0 writes the final checkpoint
+            return
         try:
             self._agent.save(str(self._save_path_base / "final"))
         except Exception as exc:

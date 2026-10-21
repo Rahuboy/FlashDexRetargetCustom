@@ -6,6 +6,8 @@ from pathlib import Path
 import wandb
 from omegaconf import DictConfig, ListConfig, OmegaConf
 
+from common import distributed
+
 _LOG_ROOT = Path("logs/rsl_rl")
 
 
@@ -25,11 +27,14 @@ def setup_logger(logger_cfg: DictConfig, runner_cfg: DictConfig) -> None:
         OmegaConf.update(logger_cfg.wandb, "run_name", full_name)
         log_dir = _LOG_ROOT / full_name
 
-    log_dir.mkdir(parents=True, exist_ok=True)
+    main = distributed.is_main()   # multi-GPU: rank 0 alone writes logs
+    if main:
+        log_dir.mkdir(parents=True, exist_ok=True)
     OmegaConf.update(runner_cfg, "log_dir", str(log_dir), force_add=True)
 
     if logger_cfg.type == "wandb":
-        _init_wandb(logger_cfg.wandb, str(log_dir))
+        if main:
+            _init_wandb(logger_cfg.wandb, str(log_dir))
         _inject_wandb_runner_keys(logger_cfg, runner_cfg)
     else:
         raise NotImplementedError(f"logger.type={logger_cfg.type!r} not supported")
@@ -111,8 +116,8 @@ def _resolve_tags(tags_cfg) -> list[str]:
 
 
 def log_metrics(metrics: dict[str, float], step: int) -> None:
-    """Log to wandb (initialized by ``setup_logger``); echo a short head to stdout."""
-    if not metrics:
+    """Log to wandb (initialized by ``setup_logger``); echo a short head to stdout. Multi-GPU: rank 0 only."""
+    if not metrics or not distributed.is_main():
         return
     wandb.log(metrics, step=step)
     head = {k: round(v, 4) for k, v in list(metrics.items())[:8]}

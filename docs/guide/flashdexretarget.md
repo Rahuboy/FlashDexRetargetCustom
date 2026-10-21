@@ -28,6 +28,7 @@ MOTION=<output_dataset_path>/xhand/motion.pt bash scripts/train_flashdexretarget
 |---|---|---|
 | `MOTION` | – (required) | motion `.pt` to train on ([`kinematic_retargeting.md`](kinematic_retargeting.md)) |
 | `ROBOT` | `xhand` | `xhand` or `sharpa`: robot config and robot USD |
+| `NPROC` | `1` | GPUs for data-parallel training ([Multi-GPU](#multi-gpu)) |
 
 The run is named `flashdexretarget-<dataset>-<robot>` and tagged `<dataset>`, `<robot>` in wandb, where
 `<dataset>` is the directory of `MOTION` (`<dataset>/motion.pt` or `<dataset>/<robot>/motion.pt`);
@@ -127,6 +128,21 @@ Every checkpoint's `resume_state.json` records the env step, the wandb id and th
 needs; resume by passing `agent_load_path=<ckpt> buffer_load_path=<ckpt> step_offset=<N>
 logger.wandb.resume=true logger.wandb.resumeid=<id> ...` to the launcher. Eval and checkpoint points lie on
 an absolute env-step grid, so a resume does not shift them.
+
+## Multi-GPU
+
+`NPROC=<n>` trains `runner=hand_ppo` (`algorithm.impl=rsl_rl`, `critic.arch` `mlp` or `simba`) data-parallel over n
+GPUs with torchrun: one process per GPU (`CUDA_VISIBLE_DEVICES` picks them), each with its own Isaac Sim, `num_envs`
+envs and seed `seed + rank`, and one policy: the gradients, the advantage / value / observation normalization and the
+adaptive learning rate's KL cover every rank's rows, while each rank draws `num_mini_batches` minibatches from its own
+rows. Env steps count every rank's envs. Rank 0 alone logs, evaluates (on its envs) and checkpoints; the other ranks'
+output goes to `logs/torchrun/`. FlashSAC refuses to start under torchrun.
+
+```bash
+# 2 GPUs x 8192 envs = 16384 envs, one policy
+CUDA_VISIBLE_DEVICES=4,7 NPROC=2 MOTION=<output_dataset_path>/xhand/motion.pt bash scripts/train_flashdexretarget.sh \
+    runner=hand_ppo num_envs=8192
+```
 
 ## Other algorithms
 

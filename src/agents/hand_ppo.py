@@ -30,6 +30,12 @@ each minibatch's pre-step means / stds (rl_games' dataset.update_mu_sigma), rl_g
 stepped once per pass on the pass's mean KL (rl_games' AdaptiveScheduler, LR in [1e-6, 1e-2]), one gradient-norm clip
 over the hand's actor + critic, the time-out bootstrap added to the stored reward at collection (rl_games'
 value_bootstrap), and the value loss clipped only with ``clip_value``.
+
+Multi-GPU (common.distributed; impl=rsl_rl with mlp / simba critics): each rank collects its own window and the update
+treats every rank's rows as one batch: rank 0's weights at construction, the advantage normalization, the value and
+observation normalizers, the adaptive LR's KL and the gradients (before clipping) are taken over every rank, so all ranks
+hold the same networks. Each rank draws its own minibatches (num_mini_batches per rank); the logged losses and policy
+stats are rank 0's rows, the KL and adv/ cover every rank.
 """
 
 from __future__ import annotations
@@ -43,6 +49,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 from omegaconf import DictConfig, OmegaConf
+
+from common import distributed
 
 from .base import Agent
 from .modules.hand_ppo_nets import FlashSACValueCritic, HandActor, HandCritic, ValueRMS
@@ -148,6 +156,10 @@ class HandPPOAgent(Agent):
                     torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=lambda step, _s=sched, _p=peak: _s(step) / _p))
         self.actors.train()
         self.critics.train()
+        if distributed.active():
+            if self.impl != "rsl_rl" or self.critic_arch == "flashsac":
+                raise NotImplementedError("multi-GPU hand_ppo supports algorithm.impl=rsl_rl with critic.arch mlp / simba")
+            distributed.broadcast_(self.actors, self.critics, self.value_rms)
 
         T, N, A, H, D = self.window, self.num_envs, self.action_dim, self.H, obs_dim
         z = dict(device=device)
@@ -326,14 +338,15 @@ class HandPPOAgent(Agent):
         ``var`` / ``std`` unbiased, ``skew`` and ``kurtosis`` (excess) the population moment ratios, ``frac_pos`` the share
         of A > 0. Logging only: nothing here feeds the update."""
         a = adv.double()
-        n = float(a.shape[0])
-        mean = a.sum(0) / n
+        n = distributed.all_reduce_(a.new_tensor(float(a.shape[0])))   # every rank's rows
+        mean = distributed.all_reduce_(a.sum(0)) / n
         d = a - mean
-        s = torch.stack([a.abs().sum(0), d.square().sum(0), d.pow(3).sum(0), d.pow(4).sum(0), (a > 0).sum(0).double()])
+        s = distributed.all_reduce_(
+            torch.stack([a.abs().sum(0), d.square().sum(0), d.pow(3).sum(0), d.pow(4).sum(0), (a > 0).sum(0).double()]))
         m2 = s[1] / n
         stats = {
             "mean_abs": s[0] / n, "mean": mean, "var": s[1] / (n - 1), "std": (s[1] / (n - 1)).sqrt(),
-            "min": a.min(0).values, "max": a.max(0).values,
+            "min": distributed.all_reduce_(a.min(0).values, "min"), "max": distributed.all_reduce_(a.max(0).values, "max"),
             "skew": s[2] / n / m2.pow(1.5), "kurtosis": s[3] / n / m2.square() - 3.0, "frac_pos": s[4] / n,
         }
         table = torch.stack(list(stats.values())).tolist()   # (stat, hand), one device sync
@@ -353,7 +366,11 @@ class HandPPOAgent(Agent):
         returns = returns.flatten(0, 1)
         adv = adv.flatten(0, 1)
         adv_stats = self._advantage_stats(adv)
-        adv = (adv - adv.mean(0, keepdim=True)) / (adv.std(0, keepdim=True) + 1e-8)
+        adv_mean, adv_std = adv.mean(0, keepdim=True), adv.std(0, keepdim=True)
+        if distributed.active():   # one batch: every rank's rows
+            _, adv_mean, adv_var = distributed.combine_moments(adv.shape[0], adv_mean, adv_std.square())
+            adv_std = adv_var.sqrt()
+        adv = (adv - adv_mean) / (adv_std + 1e-8)
         targets = returns
         old_values = self.values.flatten(0, 1)   # impl=rl_games clip_value: the rollout's values (normalized below)
         if self.normalize_value:
@@ -546,6 +563,7 @@ class HandPPOAgent(Agent):
                                 kl = (torch.log(s_new / s_old)
                                       + (s_old.square() + (mu_old[rows][:, ids] - mu_new).square()) / (2 * s_new.square())
                                       - 0.5).sum(-1).mean()
+                            kl = distributed.all_reduce_(kl, "mean")   # one learning rate on every rank
                             if kl > self.desired_kl * 2.0:
                                 self.lrs[h] = max(1e-5, self.lrs[h] / 1.5)
                             elif self.desired_kl / 2.0 > kl > 0.0:
@@ -577,6 +595,7 @@ class HandPPOAgent(Agent):
                     self.optimizers[h].zero_grad(set_to_none=True)
                     if self.critic_arch != "flashsac":
                         loss.backward()
+                        distributed.average_gradients_(self.actors[h], self.critics[h])
                         nn.utils.clip_grad_norm_(self.actors[h].parameters(), self.max_grad_norm)
                         nn.utils.clip_grad_norm_(self.critics[h].parameters(), self.max_grad_norm)
                         self.optimizers[h].step()
