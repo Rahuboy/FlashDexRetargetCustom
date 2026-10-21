@@ -10,7 +10,7 @@ Per hand h, each iteration:
 - rewards r_h are scaled by ``reward_scale`` (DexMachina's rl_games reward_shaper.scale_value); a time-out adds
   gamma * V_h(s_t) (rl_games value_bootstrap / rsl_rl time-out bootstrapping), using the stored values;
 - GAE(gamma, lam) over the window with the shared dones gives returns R_h and advantages A_h = R_h - V_h;
-  A_h is normalized over the whole batch;
+  A_h is normalized over the whole batch (its raw distribution is logged under adv/, ``_advantage_stats``);
 - with ``normalize_value`` (DexMachina's rl_games normalize_value) the critic outputs normalized values: its
   rl_games RunningMeanStd is updated with this batch's values and then its returns, the targets are the normalized
   returns, and values are de-normalized for GAE and bootstrapping;
@@ -298,6 +298,26 @@ class HandPPOAgent(Agent):
             returns[t] = adv + self.values[t]
         return returns, returns - self.values
 
+    @torch.no_grad()
+    def _advantage_stats(self, adv: torch.Tensor) -> dict[str, float]:
+        """The distribution of the raw GAE advantages per hand, logged under ``adv/`` (its own wandb section): the update
+        batch (carried rows included) in reward-scaled units, before the batch normalization. ``mean_abs`` = mean |A|,
+        ``var`` / ``std`` unbiased, ``skew`` and ``kurtosis`` (excess) the population moment ratios, ``frac_pos`` the share
+        of A > 0. Logging only: nothing here feeds the update."""
+        a = adv.double()
+        n = float(a.shape[0])
+        mean = a.sum(0) / n
+        d = a - mean
+        s = torch.stack([a.abs().sum(0), d.square().sum(0), d.pow(3).sum(0), d.pow(4).sum(0), (a > 0).sum(0).double()])
+        m2 = s[1] / n
+        stats = {
+            "mean_abs": s[0] / n, "mean": mean, "var": s[1] / (n - 1), "std": (s[1] / (n - 1)).sqrt(),
+            "min": a.min(0).values, "max": a.max(0).values,
+            "skew": s[2] / n / m2.pow(1.5), "kurtosis": s[3] / n / m2.square() - 3.0, "frac_pos": s[4] / n,
+        }
+        table = torch.stack(list(stats.values())).tolist()   # (stat, hand), one device sync
+        return {f"adv/{k}_{name}": table[i][h] for i, k in enumerate(stats) for h, name in enumerate(self.sides)}
+
     def update(self) -> dict[str, float]:
         if self.step != self.window:
             raise RuntimeError(f"update with an incomplete window ({self.step}/{self.window} rows)")
@@ -311,6 +331,7 @@ class HandPPOAgent(Agent):
         logp_old = self.logp.flatten(0, 1)
         returns = returns.flatten(0, 1)
         adv = adv.flatten(0, 1)
+        adv_stats = self._advantage_stats(adv)
         adv = (adv - adv.mean(0, keepdim=True)) / (adv.std(0, keepdim=True) + 1e-8)
         targets = returns
         old_values = self.values.flatten(0, 1)   # impl=rl_games clip_value: the rollout's values (normalized below)
@@ -377,6 +398,7 @@ class HandPPOAgent(Agent):
             "train/update_time_s": t_update,
             "train/empty_cache_s": t_cache,
         })
+        out.update(adv_stats)
         return out
 
     def _update_rl_games(self, stats: dict[str, list[float]], kl_rollout: list[float], adv: torch.Tensor,
