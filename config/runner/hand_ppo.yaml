@@ -8,6 +8,7 @@
 #     normalization (DexMachina); rl_games' bound loss on the action means (soft bound 1.1, coef 1e-4, DexMachina);
 #   - a separate Adam optimizer and adaptive learning rate per hand (rsl_rl's rule on that hand's KL).
 # actor.arch / critic.arch = simba: the alphanist (SimBa) residual trunk in place of the MLP (FDR-16/17).
+# actor.arch = critic.arch = lstm: separate LSTM actor / critic per hand, rsl_rl 5.5.1 recurrent PPO (FDR-35).
 # algorithm.impl = rl_games: DexMachina's rl_games PPO update per hand (agents.hand_ppo._update_rl_games; FDR-26/27,
 # recipe config/runner/hand_ppo_rlgames.yaml).
 # PPO+RAgger: runner.agent.carry_steps=<rows carried> (0 = plain PPO).
@@ -49,6 +50,7 @@ runner:
 
     actor:                       # rsl_rl MLP actor (config/runner/ppo.yaml) + the trajectory encoder
       arch: mlp                  # mlp (FDR-10..15) | simba: the alphanist / SimBa residual trunk (hand_ppo_nets.SimbaTrunk)
+                                 #   | lstm: rsl_rl RNNModel layout, encoder -> LSTM -> MLP hidden_dims (critic.arch lstm too)
       hidden_dims: [256, 256, 256]
       activation: elu
       obs_normalization: true
@@ -62,8 +64,12 @@ runner:
         activation: swish        # alphanist (SimBa: relu)
         ln_eps: 1.0e-6           # flax LayerNorm default (SimBa)
         head_init_scale: 0.01    # orthogonal gain of the mean head: initial means ~0 (gain 1 -> means ~N(0, 1) after the LN)
+      lstm:                      # arch: lstm only — rsl_rl RNNModel defaults (rnn_hidden_dim 256, rnn_num_layers 1)
+        hidden_dim: 256
+        num_layers: 1
     critic:                      # rsl_rl MLP critic (config/runner/ppo.yaml) + the trajectory encoder
       arch: mlp                  # mlp (FDR-10/11) | flashsac: FlashSAC's critic as V(s) (agents.modules.hand_ppo_nets) | simba
+                                 #   | lstm (with actor.arch lstm)
       hidden_dims: [256, 256, 256]
       activation: elu
       obs_normalization: true
@@ -75,6 +81,9 @@ runner:
         activation: swish
         ln_eps: 1.0e-6
         head_init_scale: 1.0
+      lstm:                      # arch: lstm only — as the actor's (its own LSTM)
+        hidden_dim: 256
+        num_layers: 1
       # arch: flashsac only — config/runner/flashsac.yaml's critic (critic_num_blocks 2, critic_hidden_dim 1024,
       # critic_num_bins 101 over [-5, 5]) without the action input, cross-entropy on two-hot normalized returns, its own
       # Adam with FlashSAC's LR (3e-4, cosine to 1.5e-4 over every critic update, no warmup, no gradient clipping)

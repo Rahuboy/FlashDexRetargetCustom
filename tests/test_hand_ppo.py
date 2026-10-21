@@ -362,4 +362,118 @@ with tempfile.TemporaryDirectory() as d:
 print(f"13. impl=rl_games: {rg.epochs} passes x {rg.num_mb} env blocks ({E} envs x {T} rows) in fixed order, LR per pass "
       f"{[pp[0] for pp in per_pass]}, kl {info['train/kl_right']:.2e} vs kl_rollout {info['train/kl_rollout_right']:.2e}, "
       f"time-out bootstrap in the stored reward, log std 1.0, zero biases, carry + clip_value run, save/load exact  OK")
+
+# ── 15. actor.arch = critic.arch = lstm (FDR-35): rsl_rl 5.5.1 recurrent PPO — states carried / zeroed after dones /
+#        recorded at the rollout start; the update's padded-trajectory pass reproduces the rollout; minibatches,
+#        masks and start states = rsl_rl's own RolloutStorage.recurrent_mini_batch_generator ──
+from rsl_rl.storage import RolloutStorage  # noqa: E402
+from tensordict import TensorDict  # noqa: E402
+
+LSTM = {"arch": "lstm", "lstm": {"hidden_dim": 16, "num_layers": 1}}
+for bad_kw in ({"actor": LSTM}, {"critic": LSTM}, {"actor": LSTM, "critic": LSTM, "carry": 3}):
+    try:
+        make(seed=30, **bad_kw)
+        raise AssertionError(f"accepted {bad_kw}")
+    except ValueError:
+        pass
+lr = make(seed=31, actor=LSTM, critic=LSTM)
+lat_in = FLAT + TRAJ["latent_dim"]
+assert lr.recurrent and isinstance(lr.actors[0].rnn, torch.nn.LSTM) and lr.actors[0].rnn.input_size == lat_in
+assert lr.actors[0].rnn.hidden_size == 16 and lr.critics[1].rnn.hidden_size == 16
+assert lr.actors[0].mlp[0].in_features == 16 and lr.critics[0].mlp[-1].out_features == 1
+assert lr.actors[0].rnn is not lr.critics[0].rnn
+try:
+    lr.actors[0].mean(torch.zeros(2, D))
+    raise AssertionError("arch=lstm mean() without a state")
+except RuntimeError:
+    pass
+# rollout 1 (zero start states), update; rollout 2 starts from the carried states (nonzero), many dones
+lr.begin_rollout()
+rollout(lr, rng, T, p_term=0.25, p_trunc=0.1)
+assert all(float(x.abs().max()) == 0.0 for x in lr._h0_a[0])
+lr.update()
+nr = lr.begin_rollout()
+assert nr == T and float(lr._h0_a[0][0].abs().max()) > 0.0 and float(lr._h0_c[1][1].abs().max()) > 0.0
+pre_a, pre_c = [], []   # the states each act sees (rsl_rl PPO.act records them before the forward)
+obs_np = rng.standard_normal((N, D)).astype(np.float32)
+for t in range(T):
+    pre_a.append(tuple(x.clone() for x in lr._state(lr._hid_a[0], lr.actors[0], N)))
+    pre_c.append(tuple(x.clone() for x in lr._state(lr._hid_c[0], lr.critics[0], N)))
+    lr.act(obs_np)
+    obs_np = rng.standard_normal((N, D)).astype(np.float32)
+    term, trunc = rng.random(N) < 0.25, rng.random(N) < 0.1
+    lr.observe({"reward": rng.standard_normal((N, H)).astype(np.float32), "terminated": term, "truncated": trunc,
+                "next_observation": obs_np})
+    if (term | trunc).any():   # rsl_rl RNN.reset(dones): the done envs' states are zero after the step
+        d = torch.as_tensor(term | trunc)
+        assert float(lr._hid_a[0][0][:, d].abs().max()) == 0.0 and float(lr._hid_c[1][1][:, d].abs().max()) == 0.0
+n_traj = int(lr.dones[:-1].sum()) + N
+assert n_traj > N + T, n_traj
+assert all(torch.equal(a, b) for a, b in zip(pre_a[0], lr._h0_a[0]))
+# (a) the update's sequence path reproduces the rollout exactly before any optimizer step (PPO ratio 1, same values)
+lp_rep, v_rep = lr.recurrent_replay()
+d_lp, d_v = float((lp_rep - lr.logp).abs().max()), float((v_rep - lr.values).abs().max())
+assert torch.allclose(lp_rep, lr.logp, atol=1e-5), d_lp
+assert torch.allclose(v_rep, lr.values, atol=1e-5), float((v_rep - lr.values).abs().max())
+# (b) rsl_rl's storage + recurrent generator on the same rollout (hand 0's actor / critic states)
+st = RolloutStorage("rl", N, T, TensorDict({"policy": lr.obs[0]}, batch_size=[N]), (A,), "cpu")
+for t in range(T):
+    tr_ = RolloutStorage.Transition()
+    tr_.observations = TensorDict({"policy": lr.obs[t]}, batch_size=[N])
+    tr_.actions = lr.actions[t]
+    tr_.rewards = lr.rewards[t, :, 0]
+    tr_.dones = lr.dones[t]
+    tr_.values = lr.values[t, :, :1]
+    tr_.actions_log_prob = lr.logp[t, :, 0]
+    tr_.distribution_params = (lr.mu[t], lr.sigma[t])
+    tr_.hidden_states = (pre_a[t], pre_c[t])
+    st.add_transition(tr_)
+padded, masks, env_idx, t_idx, offsets = lr._trajectories()
+E = N // lr.num_mb
+for i, b in enumerate(st.recurrent_mini_batch_generator(lr.num_mb, 1)):
+    tr = slice(int(offsets[i * E]), int(offsets[(i + 1) * E]))
+    assert torch.equal(b.observations["policy"], padded[:, tr]) and torch.equal(b.masks, masks[:, tr]), i
+    for ours, ref in ((lr._start_states(lr._h0_a[0], env_idx[tr], t_idx[tr]), b.hidden_states[0]),
+                      (lr._start_states(lr._h0_c[0], env_idx[tr], t_idx[tr]), b.hidden_states[1])):
+        assert all(torch.equal(x, y) for x, y in zip(ours, ref)), i
+    assert torch.equal(b.actions, lr.actions[:, i * E:(i + 1) * E]), i
+# (c) eval states are separate: deterministic acts leave the training states alone; reset / dones zero them
+h_before = tuple(x.clone() for x in lr._hid_a[1])
+xo = torch.as_tensor(rng.standard_normal((N, D)).astype(np.float32))
+lr.reset_eval_memory()
+a1 = lr.act(xo, deterministic=True)
+assert all(torch.equal(x, y) for x, y in zip(h_before, lr._hid_a[1])) and lr._eval_hid_a[0] is not None
+dn = np.zeros(N, dtype=bool)
+dn[:5] = True
+lr.on_eval_dones(dn)
+assert float(lr._eval_hid_a[0][0][:, :5].abs().max()) == 0.0 and float(lr._eval_hid_a[0][0][:, 5:].abs().max()) > 0.0
+lr.reset_eval_memory()
+assert np.array_equal(lr.act(xo, deterministic=True), a1)   # same obs from a zero state = same actions
+# (d) the update runs on the recurrent path, every network moves, metrics finite
+before = {k: v.clone() for k, v in lr.actors.state_dict().items()}
+before.update({"c." + k: v.clone() for k, v in lr.critics.state_dict().items()})
+info = lr.update()
+after = {k: v for k, v in lr.actors.state_dict().items()}
+after.update({"c." + k: v for k, v in lr.critics.state_dict().items()})
+moved = [k for k in before if "obs_norm" not in k and not torch.equal(before[k], after[k])]
+for prefix in ("0.rnn.", "1.rnn.", "0.mlp.", "c.0.rnn.", "c.1.rnn.", "c.1.mlp."):
+    assert any(k.startswith(prefix) for k in moved), prefix
+for k in ("loss/surrogate_right", "loss/value_left", "train/kl_right", "train/learning_rate_left", "loss/entropy_right"):
+    assert k in info and np.isfinite(info[k]), k
+assert lr.lrs[0] != 1e-3 or lr.lrs[1] != 1e-3
+lr.on_env_reset()
+assert lr._hid_a == [None, None] and lr._hid_c == [None, None]
+# (e) checkpoint round trip (weights incl. the LSTMs; states are not saved)
+with tempfile.TemporaryDirectory() as d_:
+    lr.save(d_)
+    lr2 = make(seed=32, actor=LSTM, critic=LSTM)
+    lr2.load(d_)
+    lr.reset_eval_memory()
+    lr2.reset_eval_memory()
+    assert np.array_equal(lr.act(xo, deterministic=True), lr2.act(xo, deterministic=True))
+print(f"15. arch=lstm: LSTM {lat_in}->16 -> MLP per actor / critic (separate); rejects mixed arch / carry; states zeroed "
+      f"after dones, recorded at the rollout start (nonzero in rollout 2); replay of {n_traj} trajectories reproduces the "
+      f"stored log-probs and values (max |d| {d_lp:.1e} / {d_v:.1e}); padded obs, masks, "
+      f"start states and minibatches = rsl_rl 5.5.1 recurrent_mini_batch_generator; eval states separate; update moves "
+      f"every LSTM / MLP; save/load exact  OK")
 print("ALL OK")

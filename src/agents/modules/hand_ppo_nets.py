@@ -4,8 +4,9 @@ Both are rsl_rl's MLPModel layout with the 1D-conv FutureTrajEncoder in front: a
 (rsl_rl EmpiricalNormalization) over every input dim, then the encoder over the future-trajectory window at the obs
 tail (each network has its own encoder; the window is replaced by its latent), then the trunk: rsl_rl's MLP (``arch:
 mlp``; PyTorch default init, as rsl_rl's MLPModel; ``init: rl_games`` zeroes its biases as rl_games' default
-initializer does) or the SimBa residual trunk of the alphanist paper (``arch: simba``, SimbaTrunk). The actor's trunk
-outputs the means of its hand's action dims; its std is rsl_rl's GaussianDistribution with std_type "scalar" (a learned
+initializer does), the SimBa residual trunk of the alphanist paper (``arch: simba``, SimbaTrunk) or rsl_rl's RNNModel
+layout (``arch: lstm``: an LSTM between the encoder and the MLP; the recurrent state is kept by agents.hand_ppo). The
+actor's trunk outputs the means of its hand's action dims; its std is rsl_rl's GaussianDistribution with std_type "scalar" (a learned
 state-independent std per dim, clamped to [1e-6, 1e6]) or, with ``std_type: log``, rl_games' learned log std. The
 critic's trunk outputs one value (in normalized units when agents.hand_ppo normalizes values).
 """
@@ -19,6 +20,7 @@ import torch
 import torch.nn as nn
 from rsl_rl.modules.mlp import MLP
 from rsl_rl.modules.normalization import EmpiricalNormalization
+from rsl_rl.utils import unpad_trajectories
 from torch.distributions import Normal
 
 from .traj_encoder import FutureTrajEncoder
@@ -79,7 +81,10 @@ class SimbaTrunk(nn.Module):
 
 class _EncodedMLP(nn.Module):
     """obs normalizer -> FutureTrajEncoder (window -> latent) -> trunk (rsl_rl MLP or SimbaTrunk; the attribute is
-    ``mlp`` for both so the ``arch: mlp`` checkpoints keep their keys)."""
+    ``mlp`` for both so the ``arch: mlp`` checkpoints keep their keys). ``arch: lstm`` = rsl_rl 5.5.1's RNNModel
+    layout: ... -> encoder -> ``rnn`` (nn.LSTM, ``lstm.hidden_dim`` x ``lstm.num_layers``, PyTorch default init as
+    rsl_rl's RNN) -> ``mlp`` (rsl_rl MLP, ``hidden_dims``) -> out; the hidden state is passed in and returned
+    (``latent_step`` for the rollout, ``latent_seq`` over padded trajectories for the update)."""
 
     def __init__(self, obs_dim: int, out_dim: int, traj_cfg: dict[str, Any] | None, cfg: dict[str, Any]) -> None:
         super().__init__()
@@ -102,8 +107,16 @@ class _EncodedMLP(nn.Module):
             if init != "rsl_rl":
                 raise ValueError("init=rl_games applies to arch=mlp only")
             self.mlp = SimbaTrunk(d_in, out_dim, cfg["simba"])
+        elif arch == "lstm":
+            if init != "rsl_rl":
+                raise ValueError("init=rl_games applies to arch=mlp only")
+            lc = dict(cfg.get("lstm") or {})
+            self.rnn = nn.LSTM(d_in, int(lc.get("hidden_dim", 256)), int(lc.get("num_layers", 1)))
+            self.mlp = MLP(self.rnn.hidden_size, out_dim, [int(h) for h in cfg.get("hidden_dims", [256, 256, 256])],
+                           str(cfg.get("activation", "elu")))
         else:
-            raise ValueError(f"arch must be 'mlp' or 'simba' here, got {arch!r}")
+            raise ValueError(f"arch must be 'mlp', 'simba' or 'lstm' here, got {arch!r}")
+        self.is_recurrent = arch == "lstm"
 
     def features(self, obs: torch.Tensor) -> torch.Tensor:
         x = self.obs_norm(obs)
@@ -112,6 +125,28 @@ class _EncodedMLP(nn.Module):
     def update_normalization(self, obs: torch.Tensor) -> None:
         if isinstance(self.obs_norm, EmpiricalNormalization):
             self.obs_norm.update(obs)
+
+    # ── arch: lstm ──
+    def zero_hidden(self, n: int, device: str | torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+        """A zero LSTM state (h, c) for ``n`` envs, each (num_layers, n, hidden) — rsl_rl's initial / reset state."""
+        shape = (self.rnn.num_layers, n, self.rnn.hidden_size)
+        return torch.zeros(shape, device=device), torch.zeros(shape, device=device)
+
+    def latent_step(self, obs: torch.Tensor, hidden: tuple[torch.Tensor, torch.Tensor]
+                    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """One step for a batch of envs (rollout / eval; rsl_rl RNN inference mode): (B, D) obs and their state ->
+        (B, hidden) latent and the next state."""
+        out, hidden = self.rnn(self.features(obs).unsqueeze(0), hidden)
+        return out.squeeze(0), hidden
+
+    def latent_seq(self, padded_obs: torch.Tensor, masks: torch.Tensor, hidden: tuple[torch.Tensor, torch.Tensor]
+                   ) -> torch.Tensor:
+        """Update (rsl_rl RNN batch mode): (L, M, D) zero-padded trajectories (rsl_rl split_and_pad_trajectories),
+        their (L, M) masks and start states -> the latents of the valid steps in the original (T, E, hidden) layout
+        (rsl_rl unpad_trajectories). Padded rows pass through the normalizer / encoder and are dropped after the LSTM."""
+        L, M, D = padded_obs.shape
+        out, _ = self.rnn(self.features(padded_obs.reshape(L * M, D)).view(L, M, -1), hidden)
+        return unpad_trajectories(out, masks)
 
 
 class HandActor(_EncodedMLP):
@@ -131,7 +166,13 @@ class HandActor(_EncodedMLP):
             raise ValueError(f"std_type must be 'scalar' or 'log', got {self.std_type!r}")
 
     def mean(self, obs: torch.Tensor) -> torch.Tensor:
+        if self.is_recurrent:
+            raise RuntimeError("arch=lstm: the means need the recurrent state (latent_step / distribution_from_latent)")
         return self.mlp(self.features(obs))
+
+    def distribution_from_latent(self, latent: torch.Tensor) -> Normal:
+        """arch=lstm: the Gaussian from the LSTM latent (means from the MLP, the state-independent std)."""
+        return Normal(self.mlp(latent), self.std())
 
     def std(self) -> torch.Tensor:
         if self.std_type == "log":
@@ -143,13 +184,19 @@ class HandActor(_EncodedMLP):
 
 
 class HandCritic(_EncodedMLP):
-    """One hand's value function: the encoded trunk with one output (``critic.arch`` mlp or simba)."""
+    """One hand's value function: the encoded trunk with one output (``critic.arch`` mlp, simba or lstm)."""
 
     def __init__(self, obs_dim: int, traj_cfg: dict[str, Any] | None, cfg: dict[str, Any]) -> None:
         super().__init__(obs_dim, 1, traj_cfg, cfg)
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        if self.is_recurrent:
+            raise RuntimeError("arch=lstm: the value needs the recurrent state (latent_step / value_from_latent)")
         return self.mlp(self.features(obs)).squeeze(-1)
+
+    def value_from_latent(self, latent: torch.Tensor) -> torch.Tensor:
+        """arch=lstm: the value from the LSTM latent."""
+        return self.mlp(latent).squeeze(-1)
 
 
 class FlashSACValueCritic(nn.Module):

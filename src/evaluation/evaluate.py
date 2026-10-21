@@ -62,6 +62,8 @@ def _rollout(
                 if hasattr(cb, "on_eval_setup"):
                     cb.on_eval_setup(raw_eval)
             obs, _ = eval_env.reset()
+            if hasattr(agent, "reset_eval_memory"):   # recurrent policies: the deterministic state restarts per batch
+                agent.reset_eval_memory()
             for cb in callbacks:
                 cb.on_start(raw_eval)
             enc_keys = sorted(key for key in obs.keys() if key not in ("actor", "critic"))
@@ -69,7 +71,9 @@ def _rollout(
             active_mask = setup_cb.active_mask
             for _ in range(n_steps):
                 actions = agent.act(_flat_actor_obs(obs, enc_keys), deterministic=True)
-                obs, _, _, _ = eval_env.step(torch.as_tensor(np.asarray(actions), device=device))
+                obs, _, dones, _ = eval_env.step(torch.as_tensor(np.asarray(actions), device=device))
+                if hasattr(agent, "on_eval_dones"):
+                    agent.on_eval_dones(dones)
                 for cb in callbacks:
                     cb.on_step(raw_eval)
             for cb in metric_cbs:

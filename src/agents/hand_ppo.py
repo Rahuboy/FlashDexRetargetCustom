@@ -30,6 +30,15 @@ each minibatch's pre-step means / stds (rl_games' dataset.update_mu_sigma), rl_g
 stepped once per pass on the pass's mean KL (rl_games' AdaptiveScheduler, LR in [1e-6, 1e-2]), one gradient-norm clip
 over the hand's actor + critic, the time-out bootstrap added to the stored reward at collection (rl_games'
 value_bootstrap), and the value loss clipped only with ``clip_value``.
+
+``actor.arch`` = ``critic.arch`` = lstm (FDR-35): separate LSTM actor and LSTM critic per hand (hand_ppo_nets, rsl_rl
+5.5.1's RNNModel layout), trained as rsl_rl 5.5.1's recurrent PPO: the LSTM states are carried from step to step, zeroed
+for the envs that are done after a step, and recorded at the rollout start; the time-out bootstrap uses the stored
+values (as above); the last value comes from the critic state without advancing it; the update (``_update_recurrent``)
+splits the window into trajectories at the dones (rsl_rl split_and_pad_trajectories), walks env-block minibatches in a
+fixed order (rsl_rl recurrent_mini_batch_generator), starts each trajectory from the recorded state (t = 0) or zeros
+(after a done), with the rsl_rl-style per-minibatch adaptive LR and per-network gradient clipping. Deterministic
+actions (eval) use their own LSTM state (``reset_eval_memory`` / ``on_eval_dones``). No RAgger carry.
 """
 
 from __future__ import annotations
@@ -108,8 +117,8 @@ class HandPPOAgent(Agent):
         critic_cfg = OmegaConf.to_container(cfg.critic, resolve=True)
         self.actors = nn.ModuleList(HandActor(obs_dim, len(i), traj_cfg, actor_cfg) for i in side_action_ids).to(device)
         self.critic_arch = str(critic_cfg.get("arch", "mlp"))
-        if self.critic_arch not in ("mlp", "flashsac", "simba"):
-            raise ValueError(f"critic.arch must be 'mlp', 'flashsac' or 'simba', got {self.critic_arch!r}")
+        if self.critic_arch not in ("mlp", "flashsac", "simba", "lstm"):
+            raise ValueError(f"critic.arch must be 'mlp', 'flashsac', 'simba' or 'lstm', got {self.critic_arch!r}")
         if self.critic_arch == "flashsac" and not self.normalize_value:
             raise ValueError("critic.arch=flashsac predicts normalized values on [min_v, max_v]: set normalize_value")
         if self.critic_arch == "flashsac" and self.impl == "rl_games":
@@ -117,10 +126,27 @@ class HandPPOAgent(Agent):
         critic_cls = FlashSACValueCritic if self.critic_arch == "flashsac" else HandCritic
         self.critics = nn.ModuleList(critic_cls(obs_dim, traj_cfg, critic_cfg) for _ in self.sides).to(device)
         self.value_rms = nn.ModuleList(ValueRMS() for _ in self.sides).to(device)
+        self.recurrent = bool(getattr(self.actors[0], "is_recurrent", False))
+        if self.recurrent or bool(getattr(self.critics[0], "is_recurrent", False)):
+            if not (self.recurrent and bool(getattr(self.critics[0], "is_recurrent", False))):
+                raise ValueError("arch=lstm needs actor.arch=lstm and critic.arch=lstm (separate recurrent actor / critic)")
+            if self.impl != "rsl_rl":
+                raise ValueError("arch=lstm is implemented for algorithm.impl=rsl_rl only")
+            if self.carry_steps:
+                raise ValueError("arch=lstm does not support carry_steps > 0 (carried rows would need their LSTM states)")
+            if self.num_envs % self.num_mb:
+                raise ValueError(f"arch=lstm: num_envs ({self.num_envs}) must be divisible by num_mini_batches ({self.num_mb})")
+        # arch=lstm: per-hand (h, c) states of the training rollout (None = zeros), their rollout-start snapshots,
+        # and the deterministic (eval) actor states
+        self._hid_a: list = [None] * self.H
+        self._hid_c: list = [None] * self.H
+        self._h0_a: list = [None] * self.H
+        self._h0_c: list = [None] * self.H
+        self._eval_hid_a: list = [None] * self.H
         self.lrs = [float(a["learning_rate"])] * self.H
         self.critic_optimizers: list[torch.optim.Optimizer] = []
         self.critic_schedulers: list[torch.optim.lr_scheduler.LambdaLR] = []
-        if self.critic_arch != "flashsac":   # mlp or simba: HandCritic, joint optimizer, MSE
+        if self.critic_arch != "flashsac":   # mlp, simba or lstm: HandCritic, joint optimizer, MSE
             # one optimizer per hand over its actor + critic; the adaptive LR (hand h's KL) drives both
             self.optimizers = [
                 torch.optim.Adam(list(self.actors[h].parameters()) + list(self.critics[h].parameters()), lr=self.lrs[h])
@@ -168,6 +194,12 @@ class HandPPOAgent(Agent):
               f"{self.critics[0]}", flush=True)
         print(f"[hand_ppo] window {T} rows = carry {self.carry_steps} + fresh {self.fresh_steps}; algorithm {a}; "
               f"empty_cache_after_update={self.empty_cache}", flush=True)
+        if self.recurrent:
+            print(f"[hand_ppo] arch=lstm: separate LSTM actor / critic per hand (LSTM {self.actors[0].rnn.hidden_size} x "
+                  f"{self.actors[0].rnn.num_layers} layer(s) -> MLP); rsl_rl recurrent PPO: BPTT over the {T}-row window, "
+                  f"trajectories split at dones, {self.num_mb} env-block minibatches of {self.num_envs // self.num_mb} envs "
+                  f"in fixed order, states recorded at the rollout start / zeroed after dones; eval uses its own state",
+                  flush=True)
         if self.impl == "rl_games":
             print(f"[hand_ppo] impl=rl_games: {self.epochs} passes x {self.num_mb} env-block minibatches of "
                   f"{self.num_envs // self.num_mb} envs x {T} rows; KL reference refreshed per minibatch; LR stepped per "
@@ -202,12 +234,21 @@ class HandPPOAgent(Agent):
         return torch.as_tensor(x, device=self.device, dtype=torch.float32)
 
     def _values(self, obs: torch.Tensor) -> torch.Tensor:
-        """(B, H) values in reward-scaled units (de-normalized when normalize_value)."""
+        """(B, H) values in reward-scaled units (de-normalized when normalize_value). arch=lstm: from the critics'
+        current training states without advancing them (rsl_rl compute_returns restores the critic state)."""
         vs = []
         for h in range(self.H):
-            v = self.critics[h](obs)
+            if self.recurrent:
+                lat, _ = self.critics[h].latent_step(obs, self._state(self._hid_c[h], self.critics[h], obs.shape[0]))
+                v = self.critics[h].value_from_latent(lat)
+            else:
+                v = self.critics[h](obs)
             vs.append(self.value_rms[h].denormalize(v) if self.normalize_value else v)
         return torch.stack(vs, dim=-1)
+
+    def _state(self, hidden, net: nn.Module, n: int):
+        """arch=lstm: a stored (h, c) state, or zeros for ``n`` envs when there is none yet."""
+        return hidden if hidden is not None else net.zero_hidden(n, self.device)
 
     # ─── rollout ─────────────────────────────────────────────────────────────────
     def begin_rollout(self) -> int:
@@ -225,10 +266,17 @@ class HandPPOAgent(Agent):
                 self.values[:c] = flat.view(c, self.num_envs, self.H)
             self.step = c
             self._carried_now = c
+        if self.recurrent:   # the states every trajectory that starts at t = 0 begins from (rsl_rl saved hidden states)
+            self._h0_a = [tuple(x.clone() for x in self._state(self._hid_a[h], self.actors[h], self.num_envs))
+                          for h in range(self.H)]
+            self._h0_c = [tuple(x.clone() for x in self._state(self._hid_c[h], self.critics[h], self.num_envs))
+                          for h in range(self.H)]
         return self.window - self.step
 
     def act(self, obs: Any, deterministic: bool = False) -> np.ndarray:
         obs_t = self._to_tensor(obs)
+        if self.recurrent:
+            return self._act_recurrent(obs_t, deterministic)
         with torch.no_grad():
             action = torch.zeros(obs_t.shape[0], self.action_dim, device=self.device)
             if deterministic:
@@ -248,6 +296,44 @@ class HandPPOAgent(Agent):
             self._pending = {"obs": obs_t, "actions": action, "mu": mu, "sigma": sigma, "logp": logp,
                              "values": self._values(obs_t)}
         return action.clamp(-self.clip_actions, self.clip_actions).cpu().numpy()
+
+    @torch.no_grad()
+    def _act_recurrent(self, obs_t: torch.Tensor, deterministic: bool) -> np.ndarray:
+        """arch=lstm act: deterministic = eval (its own actor states); else sample, advance the training actor and
+        critic states (rsl_rl PPO.act records the states before this step: begin_rollout's snapshot + zeros after dones)."""
+        n = obs_t.shape[0]
+        action = torch.zeros(n, self.action_dim, device=self.device)
+        if deterministic:
+            for h in range(self.H):
+                lat, self._eval_hid_a[h] = self.actors[h].latent_step(
+                    obs_t, self._state(self._eval_hid_a[h], self.actors[h], n))
+                action[:, self.ids[h]] = self.actors[h].mlp(lat)
+            return action.clamp(-self.clip_actions, self.clip_actions).cpu().numpy()
+        mu = torch.zeros_like(action)
+        sigma = torch.zeros_like(action)
+        logp = torch.zeros(n, self.H, device=self.device)
+        values = torch.zeros(n, self.H, device=self.device)
+        for h in range(self.H):
+            lat, self._hid_a[h] = self.actors[h].latent_step(obs_t, self._state(self._hid_a[h], self.actors[h], n))
+            dist = self.actors[h].distribution_from_latent(lat)
+            a_h = dist.sample()
+            action[:, self.ids[h]] = a_h
+            mu[:, self.ids[h]] = dist.mean
+            sigma[:, self.ids[h]] = dist.stddev
+            logp[:, h] = dist.log_prob(a_h).sum(-1)
+            lat_c, self._hid_c[h] = self.critics[h].latent_step(obs_t, self._state(self._hid_c[h], self.critics[h], n))
+            v = self.critics[h].value_from_latent(lat_c)
+            values[:, h] = self.value_rms[h].denormalize(v) if self.normalize_value else v
+        self._pending = {"obs": obs_t, "actions": action, "mu": mu, "sigma": sigma, "logp": logp, "values": values}
+        return action.clamp(-self.clip_actions, self.clip_actions).cpu().numpy()
+
+    @staticmethod
+    def _zero_done(states: list, done: torch.Tensor) -> None:
+        """Zero the (h, c) states of the done envs in place (rsl_rl RNN.reset(dones))."""
+        for hid in states:
+            if hid is not None:
+                for x in hid:
+                    x[:, done] = 0.0
 
     def observe(self, transition: Mapping[str, Any]) -> None:
         """One env step of the rollout (after act). ``reward`` is (B, H) head rewards; ``next_observation`` is the
@@ -272,6 +358,8 @@ class HandPPOAgent(Agent):
             self.rewards[t] = rewards * self.reward_scale
         self.dones[t] = terminated | truncated
         self.timeouts[t] = truncated
+        if self.recurrent and bool(self.dones[t].any()):   # rsl_rl process_env_step: actor / critic reset(dones)
+            self._zero_done(self._hid_a + self._hid_c, self.dones[t])
         self.step += 1
         self._pending = None
         self._last_obs = self._to_tensor(transition["next_observation"])
@@ -335,6 +423,8 @@ class HandPPOAgent(Agent):
         kl_rollout = [0.0] * self.H
         if self.impl == "rl_games":
             n_updates = self._update_rl_games(stats, kl_rollout, adv, targets, old_values)
+        elif self.recurrent:
+            n_updates = self._update_recurrent(stats, adv, targets)
         else:
             n_updates = self._update_rsl_rl(stats, B, obs, actions, mu_old, sigma_old, logp_old, adv, targets)
 
@@ -539,9 +629,126 @@ class HandPPOAgent(Agent):
                 n_updates += 1
         return n_updates
 
+    def _trajectories(self):
+        """arch=lstm: the window split into trajectories at the dones (rsl_rl split_and_pad_trajectories; env-major
+        order), their masks, each trajectory's (env, start step), and the per-env offsets into the trajectory list."""
+        from rsl_rl.utils import split_and_pad_trajectories
+
+        padded, masks = split_and_pad_trajectories(self.obs, self.dones.unsqueeze(-1))
+        starts = torch.zeros_like(self.dones)
+        starts[0] = True
+        starts[1:] = self.dones[:-1]   # rsl_rl last_was_done
+        env_idx, t_idx = starts.transpose(0, 1).nonzero(as_tuple=True)   # env-major = the padded order
+        offsets = torch.cat([starts.new_zeros(1, dtype=torch.long), starts.sum(0).cumsum(0)])
+        return padded, masks, env_idx, t_idx, offsets
+
+    @staticmethod
+    def _start_states(h0: tuple, env_idx: torch.Tensor, t_idx: torch.Tensor) -> tuple:
+        """The (h, c) state each trajectory starts from: the rollout-start state of its env if it starts at t = 0,
+        zeros if it starts after a done (rsl_rl: the saved state at a trajectory start)."""
+        first = t_idx == 0
+        out = []
+        for x in h0:
+            st = x.new_zeros(x.shape[0], env_idx.shape[0], x.shape[2])
+            st[:, first] = x[:, env_idx[first]]
+            out.append(st)
+        return tuple(out)
+
+    @torch.no_grad()
+    def recurrent_replay(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """arch=lstm diagnostic: the window's (T, N, H) log-probs and values recomputed through the update's
+        sequence path with the current parameters (equal to the stored ones before any optimizer step)."""
+        padded, masks, env_idx, t_idx, _ = self._trajectories()
+        logp = torch.zeros_like(self.logp)
+        values = torch.zeros_like(self.values)
+        for h in range(self.H):
+            lat = self.actors[h].latent_seq(padded, masks, self._start_states(self._h0_a[h], env_idx, t_idx))
+            logp[..., h] = self.actors[h].distribution_from_latent(lat).log_prob(self.actions[..., self.ids[h]]).sum(-1)
+            lat_c = self.critics[h].latent_seq(padded, masks, self._start_states(self._h0_c[h], env_idx, t_idx))
+            v = self.critics[h].value_from_latent(lat_c)
+            values[..., h] = self.value_rms[h].denormalize(v) if self.normalize_value else v
+        return logp, values
+
+    def _update_recurrent(self, stats: dict[str, list[float]], adv: torch.Tensor, targets: torch.Tensor) -> int:
+        """arch=lstm (rsl_rl 5.5.1 recurrent PPO): minibatch i = envs [i E, (i + 1) E) with all their trajectories
+        (rsl_rl recurrent_mini_batch_generator: the same order every epoch); per minibatch and hand the actor and critic
+        run over the padded trajectories from their start states and return to the (T, E) layout; then the losses,
+        the adaptive LR on the KL to the rollout policy, and the per-network gradient clipping of _update_rsl_rl.
+        Returns the number of minibatch steps."""
+        T, N, H = self.window, self.num_envs, self.H
+        E = N // self.num_mb
+        adv = adv.view(T, N, H)
+        targets = targets.view(T, N, H)
+        padded, masks, env_idx, t_idx, offsets = self._trajectories()
+        n_updates = 0
+        for _ in range(self.epochs):
+            for i in range(self.num_mb):
+                tr = slice(int(offsets[i * E]), int(offsets[(i + 1) * E]))
+                sl = slice(i * E, (i + 1) * E)
+                o, mk, ei, ti = padded[:, tr], masks[:, tr], env_idx[tr], t_idx[tr]
+                for h in range(H):
+                    ids = self.ids[h]
+                    lat = self.actors[h].latent_seq(o, mk, self._start_states(self._h0_a[h], ei, ti)).flatten(0, 1)
+                    dist = self.actors[h].distribution_from_latent(lat)
+                    mu_new = dist.mean
+                    if self.schedule == "adaptive":
+                        with torch.no_grad():
+                            s_old = self.sigma[:, sl][..., ids].flatten(0, 1)
+                            m_old = self.mu[:, sl][..., ids].flatten(0, 1)
+                            s_new = dist.stddev.expand_as(mu_new)
+                            kl = (torch.log(s_new / s_old)
+                                  + (s_old.square() + (m_old - mu_new).square()) / (2 * s_new.square())
+                                  - 0.5).sum(-1).mean()
+                            if kl > self.desired_kl * 2.0:
+                                self.lrs[h] = max(1e-5, self.lrs[h] / 1.5)
+                            elif self.desired_kl / 2.0 > kl > 0.0:
+                                self.lrs[h] = min(1e-2, self.lrs[h] * 1.5)
+                            for g in self.optimizers[h].param_groups:
+                                g["lr"] = self.lrs[h]
+                            stats["kl"][h] += float(kl)
+                    logp = dist.log_prob(self.actions[:, sl][..., ids].flatten(0, 1)).sum(-1)
+                    ratio = torch.exp(logp - self.logp[:, sl, h].flatten())
+                    a_h = adv[:, sl, h].flatten()
+                    surrogate = torch.max(-a_h * ratio,
+                                          -a_h * ratio.clamp(1.0 - self.clip_param, 1.0 + self.clip_param)).mean()
+                    lat_c = self.critics[h].latent_seq(o, mk, self._start_states(self._h0_c[h], ei, ti)).flatten(0, 1)
+                    v = self.critics[h].value_from_latent(lat_c)
+                    value_loss = (targets[:, sl, h].flatten() - v).square().mean()
+                    s = self.bounds_soft
+                    bounds = ((mu_new - s).clamp_min(0.0).square() + (mu_new + s).clamp_max(0.0).square()).sum(-1).mean()
+                    entropy = dist.entropy().sum(-1).mean()
+                    loss = surrogate + self.vf_coef * value_loss + self.bounds_coef * bounds - self.ent_coef * entropy
+                    self.optimizers[h].zero_grad(set_to_none=True)
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(self.actors[h].parameters(), self.max_grad_norm)
+                    nn.utils.clip_grad_norm_(self.critics[h].parameters(), self.max_grad_norm)
+                    self.optimizers[h].step()
+                    stats["surrogate"][h] += float(surrogate)
+                    stats["value"][h] += float(value_loss)
+                    stats["bounds"][h] += float(bounds)
+                    stats["entropy"][h] += float(entropy)
+                    stats["clip_frac"][h] += float(((ratio - 1.0).abs() > self.clip_param).float().mean())
+                n_updates += 1
+        return n_updates
+
     def on_env_reset(self) -> None:
-        """The runner reset the train envs (eval drove them): the previous window is no longer contiguous."""
+        """The runner reset the train envs (eval drove them): the previous window is no longer contiguous; arch=lstm:
+        the training LSTM states restart from zeros."""
         self._have_prev = False
+        self._hid_a = [None] * self.H
+        self._hid_c = [None] * self.H
+
+    def reset_eval_memory(self) -> None:
+        """evaluation.evaluate, at every eval batch reset: arch=lstm deterministic actions restart from zero states."""
+        self._eval_hid_a = [None] * self.H
+
+    def on_eval_dones(self, dones: Any) -> None:
+        """evaluation.evaluate, after every eval step: zero the eval LSTM states of the envs that are done."""
+        if not self.recurrent:
+            return
+        d = torch.as_tensor(np.asarray(dones) if not torch.is_tensor(dones) else dones, device=self.device).view(-1).bool()
+        if bool(d.any()):
+            self._zero_done(self._eval_hid_a, d)
 
     # ─── checkpoints ─────────────────────────────────────────────────────────────
     def save(self, path: str) -> None:
